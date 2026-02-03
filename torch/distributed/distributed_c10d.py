@@ -53,10 +53,10 @@ from torch.monitor import _WaitCounter
 from torch.overrides import handle_torch_function, has_torch_function
 from torch.utils._typing_utils import not_none
 
+from . import config as dist_config
 from .c10d_logger import _exception_logger, _time_logger
 from .constants import default_pg_nccl_timeout, default_pg_timeout
 from .rendezvous import register_rendezvous_handler, rendezvous  # noqa: F401
-from . import config as dist_config
 
 
 __all__ = [
@@ -153,6 +153,7 @@ if _TORCHCOMM_AVAILABLE:
 def _use_torchcomms_enabled() -> bool:
     """Check if torchcomms is enabled via config."""
     return _TORCHCOMM_AVAILABLE and dist_config.use_torchcomms
+
 
 _pickler = pickle.Pickler
 _unpickler = pickle.Unpickler
@@ -2086,7 +2087,9 @@ def _new_process_group_helper(
                 backend_str,
             )
             # TODO: figure out pg option conversion for torchComms.
-            comm = new_comm(backend_str, torch_device, name=group_name, store=backend_prefix_store)
+            comm = new_comm(
+                backend_str, torch_device, name=group_name, store=backend_prefix_store
+            )
             # We need to keep a reference to the python object otherwise after this function the object gets delete.
             # This also help us perform bookkeeping of comms so that we can do finalize when the program finishes.
             _world.add_comm(comm)

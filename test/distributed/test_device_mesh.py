@@ -9,9 +9,9 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch._C._distributed_c10d import Backend as C10dBackend
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.distributed import config as dist_config
 from torch.distributed._mesh_layout import _MeshLayout as _Layout
 from torch.distributed.device_mesh import _mesh_resources, DeviceMesh, init_device_mesh
-from torch.distributed import config as dist_config
 from torch.distributed.distributed_c10d import (
     _get_default_group,
     _TORCHCOMM_AVAILABLE,
