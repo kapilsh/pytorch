@@ -725,9 +725,22 @@ class _World:
         """Add a comm object to the global list."""
         global _comms, _comms_atexit_registered
         if not _comms_atexit_registered:
-            atexit.register(_finalize_comms)
+            atexit.register(self.finalize_comms)
             _comms_atexit_registered = True
         _comms.append(comm)
+
+    def finalize_comms(self) -> None:
+        """Finalize all torchcomm comm objects.
+
+        This method is safe to call multiple times - subsequent calls are no-ops
+        if comms have already been finalized.
+        """
+        global _comms
+        if not _comms:
+            return
+        for comm in _comms:
+            comm.finalize()
+        _comms.clear()
 
     @property
     def pg_config_info(self) -> list[dict[str, Any]]:
@@ -784,14 +797,6 @@ class GroupMember(metaclass=_WorldMeta):
     """Group member class."""
 
     NON_GROUP_MEMBER = -100
-
-
-def _finalize_comms() -> None:
-    """Finalize all torchcomm comm objects in the global list."""
-    global _comms
-    for comm in _comms:
-        comm.finalize()
-    _comms.clear()
 
 
 def _get_default_timeout(backend: Backend) -> timedelta:
@@ -2345,6 +2350,10 @@ def destroy_process_group(group: ProcessGroup | None = None):
         # We only reset this when WORLD is being destroyed because if this
         # process group is in good state, we aren't dealing with failures.
         _world.group_count = 0
+
+        # Finalize torchcomm comm objects when destroying all process groups
+        if _use_torchcomms_enabled():
+            _world.finalize_comms()
     else:
         pg.shutdown()
         del _world.pg_map[pg]

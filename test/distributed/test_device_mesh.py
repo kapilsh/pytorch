@@ -1569,14 +1569,14 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
         self.assertEqual(gpu_tensor, expected_gpu_tensor)
 
     @unittest.skipIf(not _TORCHCOMM_AVAILABLE, "TorchComms is not installed")
-    @dist_config.patch(use_torchcomms=True, backend="cuda:ncclx")
+    @dist_config.patch(use_torchcomms=True)
     @with_comms(backend="cpu:gloo,cuda:ncclx")
     def test_device_mesh_w_torchcomms(self) -> None:
         mesh_shape = (2, 2, self.world_size // 4)
         backend_override = {
-            "pp": "ncclx",
-            "dp": "ncclx",
-            "tp": "ncclx",
+            "pp": "cuda:ncclx",
+            "dp": "cuda:ncclx",
+            "tp": "cuda:ncclx",
         }
         mesh_3d = init_device_mesh(
             self.device_type,
