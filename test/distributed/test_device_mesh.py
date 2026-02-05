@@ -1573,16 +1573,10 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
     @with_comms(backend="cpu:gloo,cuda:ncclx")
     def test_device_mesh_w_torchcomms(self) -> None:
         mesh_shape = (2, 2, self.world_size // 4)
-        backend_override = {
-            "pp": "cuda:ncclx",
-            "dp": "cuda:ncclx",
-            "tp": "cuda:ncclx",
-        }
         mesh_3d = init_device_mesh(
             self.device_type,
             mesh_shape,
             mesh_dim_names=("pp", "dp", "tp"),
-            backend_override=backend_override,
         )
         dp_rank = mesh_3d.get_local_rank("dp")
         expected_dp_rank = 0 if self.rank % 4 <= 1 else 1
