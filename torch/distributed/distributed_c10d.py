@@ -144,10 +144,12 @@ _GLOO_AVAILABLE = True
 _UCC_AVAILABLE = True
 _XCCL_AVAILABLE = True
 
-_TORCHCOMM_AVAILABLE = importlib.util.find_spec("torchcomms") is not None
-if _TORCHCOMM_AVAILABLE:
-    # pyrefly: ignore [import-error, missing-import]
+try:
     from torchcomms._comms import _BackendWrapper, new_comm
+
+    _TORCHCOMM_AVAILABLE = True
+except ImportError:
+    _TORCHCOMM_AVAILABLE = False
 
 
 def _use_torchcomms_enabled() -> bool:
