@@ -2237,11 +2237,18 @@ def set_signal_pad_size(size: int) -> None:
 
     .. warning::
         This must be called before any symmetric memory allocations are made.
-        The size cannot be changed after allocations have been performed.
+        The signal pad size determines where the data buffer starts within an
+        allocation, so it is frozen on the first allocation; changing it
+        afterwards raises a ``RuntimeError``. Re-setting it to the value it
+        already has remains a no-op.
 
     Args:
         size (int): the signal pad size in bytes. The size should be
             proportional to the number of blocks launched and the world size.
+
+    Raises:
+        RuntimeError: if called with a new size after a symmetric memory
+            allocation has already been made.
 
     Example::
 

@@ -352,9 +352,10 @@ void* CUDASymmetricMemoryAllocator::alloc(
     int device_idx,
     const std::optional<std::string>& group_name) {
   // buffer_offset is the signal pad size rounded up to signal_pad_alignment so
-  // the data buffer stays aligned.
-  size_t buffer_offset =
-      at::round_up(get_signal_pad_size(), signal_pad_alignment);
+  // the data buffer stays aligned. Freeze it first: it is baked into this
+  // allocation's layout for as long as the allocation is live.
+  freeze_signal_pad_size();
+  size_t buffer_offset = get_buffer_offset();
   size_t block_size = buffer_offset + at::round_up(size, 16UL);
   c10::cuda::CUDAGuard guard(device_idx);
   device_idx = static_cast<int>(guard.current_device().index());
