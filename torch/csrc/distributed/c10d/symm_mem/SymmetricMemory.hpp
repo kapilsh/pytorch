@@ -177,12 +177,14 @@ TORCH_API at::Tensor empty_strided_p2p(
     std::optional<uint64_t> alloc_id);
 
 // Establishes symmetric memory access on tensors allocated via
-// empty_strided_p2p() and empty_strided_p2p_persistent(). rendezvous() is a
-// one-time process, and the mapping between a local memory region and the
-// associated SymmetricMemory object is unique. Subsequent calls to
-// rendezvous() with the same tensor, or tensors allocated with
-// empty_strided_p2p_persistent() using the same alloc_id, will receive the
-// cached SymmetricMemory object.
+// empty_strided_p2p() and empty_strided_p2p_persistent().
+//
+// The expensive part of a rendezvous -- exchanging handles with peers and
+// mapping their memory -- happens once per (allocation, group) and is reused by
+// every subsequent call on that allocation, including calls for tensors at
+// different offsets within it. The returned SymmetricMemory is a thin handle
+// over that shared state plus the caller's offset, so repeated calls may return
+// distinct but equivalent objects; do not rely on object identity.
 //
 // The function has a collective semantic and must be invoked simultaneously
 // from all rendezvous participants.

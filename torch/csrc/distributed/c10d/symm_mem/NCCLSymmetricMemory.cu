@@ -77,14 +77,6 @@ namespace {
 
 // Base allocation ptr -> owning NCCL allocation metadata.
 using NCCLAllocMap = ska::flat_hash_map<void*, std::unique_ptr<NCCLAllocation>>;
-// (Tensor storage/data ptr, group name) -> cached SymmetricMemory handle.
-using NCCLSymmMemMap = ska::flat_hash_map<
-    SymmMemKey,
-    c10::intrusive_ptr<NCCLSymmetricMemory>,
-    SymmMemKeyHash>;
-// Base allocation ptr -> cached `(tensor ptr, group)` keys derived from it.
-using NCCLSymmMemKeysByAlloc =
-    ska::flat_hash_map<void*, ska::flat_hash_set<SymmMemKey, SymmMemKeyHash>>;
 
 bool pointer_in_allocation(void* ptr, const NCCLAllocation& allocation) {
   auto ptr_int = reinterpret_cast<uintptr_t>(ptr);
@@ -530,18 +522,7 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
 
   void free(void* ptr) override {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto alloc_it = allocations_.find(ptr);
-    if (alloc_it == allocations_.end()) {
-      return;
-    }
-    auto cache_keys_it = symm_mem_keys_by_alloc_.find(ptr);
-    if (cache_keys_it != symm_mem_keys_by_alloc_.end()) {
-      for (const auto& key : cache_keys_it->second) {
-        symm_mems_.erase(key);
-      }
-      symm_mem_keys_by_alloc_.erase(cache_keys_it);
-    }
-    allocations_.erase(alloc_it);
+    allocations_.erase(ptr);
   };
 
   size_t get_alloc_size(void* ptr) override {
@@ -558,19 +539,13 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
       void* ptr,
       const std::optional<std::string>& group_name) override {
     TORCH_CHECK(group_name.has_value(), "group_name must be provided");
-    NCCLAllocation* allocation;
+    NCCLAllocation* allocation = nullptr;
     // The covering allocation's map key is buffer_ptr (the data buffer base
     // alloc() returned, == alloc_base + buffer_offset); captured here so we
     // don't recompute it below.
-    void* buffer_ptr_key = nullptr;
-    SymmMemKey key{ptr, *group_name};
+    void* buffer_ptr = nullptr;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      auto it = symm_mems_.find(key);
-      if (it != symm_mems_.end()) {
-        return it->second;
-      }
-
       // Find the allocation covering the ptr under the allocator lock.
       // We grab a raw pointer to the NCCLAllocation so we can release the
       // allocator lock before doing expensive per-allocation work.
@@ -580,41 +555,25 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
           "Pointer not within any SymmetricMemory allocation, "
           "is the tensor allocated from SymmetricMemory?");
       allocation = alloc_it->second.get();
-      buffer_ptr_key = alloc_it->first;
+      buffer_ptr = alloc_it->first;
     }
 
     // Get or create peer alloc info for the group under the per-allocation
     // lock. This serializes concurrent rendezvous on the same allocation
     // for different groups (e.g., forward vs backward).
     std::lock_guard<std::mutex> alloc_lock(allocation->mutex);
-    auto& peer_alloc_infos = allocation->peer_alloc_infos_;
-    auto& pai = peer_alloc_infos[*group_name];
+    auto& pai = allocation->peer_alloc_infos_[*group_name];
     if (!pai) {
       pai = c10::make_intrusive<NCCLPeerAllocInfo>(allocation, *group_name);
     }
-    // Offset is relative to the data buffer base (past the signal pad).
+    // Offset is relative to the data buffer base (past the signal pad). The
+    // handle is just a (peer alloc info, offset) pair, so it is rebuilt per
+    // call; the expensive window registration lives in `pai` and is shared by
+    // every handle on this allocation and group, including handles at
+    // different offsets.
     size_t offset = reinterpret_cast<uintptr_t>(ptr) -
-        reinterpret_cast<uintptr_t>(buffer_ptr_key);
-    // Create the SymmetricMemory handle.
-    auto symm_mem = c10::make_intrusive<NCCLSymmetricMemory>(pai, offset);
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      // Insert the SymmetricMemory handle into the map (cache), keyed by the
-      // (Tensor storage ptr, group name) pair.
-      auto [it, inserted] = symm_mems_.emplace(key, symm_mem);
-      if (!inserted) {
-        // This condition should rarely happen, only when another thread happens
-        // to be concurrently rendezvousing with the same allocation for the
-        // same group.  For safety, we return the existing SymmetricMemory
-        // handle and discard the new one.
-        return it->second;
-      }
-      // There is no more use of `key`; we can move it into the per-allocation
-      // key set to avoid an extra copy. Key by the data pointer (the value
-      // returned by alloc()), matching the lookup done in free().
-      symm_mem_keys_by_alloc_[buffer_ptr_key].insert(std::move(key));
-    }
-    return symm_mem;
+        reinterpret_cast<uintptr_t>(buffer_ptr);
+    return c10::make_intrusive<NCCLSymmetricMemory>(pai, offset);
   }
 
   bool has_multicast_support(int device_idx) override {
@@ -637,8 +596,6 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
  private:
   std::mutex mutex_;
   NCCLAllocMap allocations_;
-  NCCLSymmMemMap symm_mems_;
-  NCCLSymmMemKeysByAlloc symm_mem_keys_by_alloc_;
 };
 
 struct RegisterNCCLSymmetricMemoryAllocator {
