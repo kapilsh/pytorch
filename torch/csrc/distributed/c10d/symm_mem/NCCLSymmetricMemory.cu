@@ -95,17 +95,6 @@ bool pointer_in_allocation(void* ptr, const NCCLAllocation& allocation) {
   return ptr_int >= buffer_ptr && ptr_int < buffer_ptr + allocation.buffer_size;
 }
 
-NCCLAllocMap::iterator find_allocation_covering_linear(
-    void* ptr,
-    NCCLAllocMap& allocations) {
-  return std::find_if(
-      allocations.begin(),
-      allocations.end(),
-      [&](const auto& entry) {
-        return pointer_in_allocation(ptr, *entry.second);
-      });
-}
-
 NCCLAllocMap::iterator find_allocation_covering(
     void* ptr,
     NCCLAllocMap& allocations) {
@@ -113,16 +102,23 @@ NCCLAllocMap::iterator find_allocation_covering(
   if (alloc_it != allocations.end()) {
     return alloc_it;
   }
-  // `ptr` is not an allocation key (a MemPool hands out interior pointers), so
-  // scan for the allocation whose [buffer, buffer + size) range covers it. We
-  // deliberately do not reconstruct the key from the process-global pad size:
-  // get_signal_pad_size() may have changed via set_signal_pad_size() since
-  // this allocation was created, whereas the scan uses each allocation's own
-  // stored buffer_offset.
-  // TODO: this linear std::find_if is O(n) in the number of live allocations.
-  // Make it O(log n) by switching NCCLAllocMap to an ordered map and using
-  // upper_bound to find the covering allocation.
-  return find_allocation_covering_linear(ptr, allocations);
+  // `ptr` is not an allocation key (a MemPool hands out interior pointers).
+  // Recover the allocation base from the driver -- ncclMemAlloc is VMM-backed,
+  // so cuMemGetAddressRange resolves it -- and rebuild the key alloc() stored.
+  // Adding a process-global offset to the base is sound because the signal pad
+  // size is frozen on the first allocation; see NOTE [symmetric memory buffer
+  // offset is process-global].
+  void* alloc_base = get_allocation_base(ptr);
+  if (alloc_base == nullptr) {
+    return allocations.end();
+  }
+  void* buffer_ptr = static_cast<char*>(alloc_base) + get_buffer_offset();
+  alloc_it = allocations.find(buffer_ptr);
+  if (alloc_it == allocations.end() ||
+      !pointer_in_allocation(ptr, *alloc_it->second)) {
+    return allocations.end();
+  }
+  return alloc_it;
 }
 
 } // namespace
