@@ -153,5 +153,11 @@ void map_block(
     size_t size,
     int device_idx);
 
+// Returns the base address of the device allocation that `ptr` points into, or
+// nullptr if `ptr` is not a device pointer the driver knows about. All
+// symmetric memory backends are VMM-backed, so this recovers an allocation's
+// base from any interior pointer in O(1).
+void* get_allocation_base(void* ptr);
+
 } // namespace symmetric_memory
 } // namespace c10d
