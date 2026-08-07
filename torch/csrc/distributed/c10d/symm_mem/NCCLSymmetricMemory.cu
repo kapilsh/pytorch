@@ -377,7 +377,7 @@ void NCCLSymmetricMemory::barrier(int channel, size_t timeout_ms) {
       "NCCLSymmetricMemory::barrier requires peer signal pad pointers, which "
       "are only populated when peers are accessible over the symmetric-memory "
       "(LSA/NVLink) domain.");
-  check_channel(channel, world_size_, get_signal_pad_size());
+  check_channel(channel, world_size_);
   c10::cuda::CUDAGuard device_guard(device_idx_);
   barrier_kernel<<<
       1,

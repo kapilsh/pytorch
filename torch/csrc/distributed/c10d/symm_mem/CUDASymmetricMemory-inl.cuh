@@ -108,33 +108,12 @@ __device__ __forceinline__ void wait_signal(uint32_t* addr) {
     ;
 }
 
-// Validates the channel argument for barrier(), put_signal() and
-// wait_signal(). Shared by the CUDA and NCCL symmetric-memory backends.
-// ``signal_pad_size`` is passed in (rather than calling get_signal_pad_size()
-// here) so this header doesn't need to include SymmetricMemory.hpp.
-inline void check_channel(int channel, int world_size, size_t signal_pad_size) {
-  TORCH_CHECK(
-      channel >= 0,
-      "channel for barrier(), put_signal() and wait_signal() ",
-      "must be greater than 0 (got ",
-      channel,
-      ")");
-  const size_t num_channels =
-      signal_pad_size / (sizeof(uint32_t) * world_size);
-  TORCH_CHECK(
-      static_cast<size_t>(channel) < num_channels,
-      "The maximum supported channel for barrier(), put_signal() and wait_signal() is ",
-      num_channels - 1,
-      " (got ",
-      channel,
-      ")");
-}
-
 // All-to-all signal barrier over the symmetric-memory signal pads, shared by
-// the CUDA and NCCL backends. Each rank sets a flag in every peer's signal pad
-// (at its own slot) and waits for every peer to set the matching flag in its
-// own pad. The try_put_signal/try_wait_signal CAS protocol toggles each slot
-// 0->1 then 1->0, so the pads return to zero and the barrier is reusable.
+// the CUDA, NCCL and NVSHMEM backends. Each rank sets a flag in every peer's
+// signal pad (at its own slot) and waits for every peer to set the matching
+// flag in its own pad. The try_put_signal/try_wait_signal CAS protocol toggles
+// each slot 0->1 then 1->0, so the pads return to zero and the barrier is
+// reusable.
 [[maybe_unused]] static __global__ void barrier_kernel(
     uint32_t** signal_pads,
     int channel,
@@ -171,6 +150,56 @@ inline void check_channel(int channel, int world_size, size_t signal_pad_size) {
       trap();
     }
   }
+}
+
+// Point-to-point counterparts of barrier_kernel, over the same signal pads:
+// the producer flips its slot in the consumer's pad 0->1, the consumer flips
+// that slot back 1->0.
+[[maybe_unused]] static __global__ void put_signal_kernel(
+    uint32_t** signal_pads,
+    int dst_rank,
+    int channel,
+    int rank,
+    int world_size,
+    size_t timeout_ms) {
+  if (threadIdx.x == 0) {
+    bool success = try_put_signal<std::memory_order_release>(
+        signal_pads[dst_rank] + world_size * channel + rank, timeout_ms);
+    if (!success) {
+      printf(
+          "[FATAL] SymmetricMemory::put_signal: rank %d failed to send signal "
+          "to rank %d on channel %d after %lu milliseconds\n",
+          rank,
+          dst_rank,
+          channel,
+          timeout_ms);
+      trap();
+    }
+  }
+}
+
+[[maybe_unused]] static __global__ void wait_signal_kernel(
+    uint32_t** signal_pads,
+    int src_rank,
+    int channel,
+    int rank,
+    int world_size,
+    size_t timeout_ms) {
+  if (threadIdx.x == 0) {
+    bool success = try_wait_signal<std::memory_order_acquire>(
+        signal_pads[rank] + world_size * channel + src_rank, timeout_ms);
+    if (!success) {
+      printf(
+          "[FATAL] SymmetricMemory::wait_signal: rank %d failed to receive signal "
+          "from rank %d on channel %d after %lu milliseconds\n",
+          rank,
+          src_rank,
+          channel,
+          timeout_ms);
+      trap();
+    }
+  }
+  __threadfence_system();
 }
 
 // Synchronizes blocks with matching blockIdx across participating devices.

@@ -13,6 +13,28 @@
 namespace c10d {
 namespace symmetric_memory {
 
+// Validates the channel argument for barrier(), put_signal() and
+// wait_signal(). Shared by the CUDA, NCCL and NVSHMEM symmetric-memory
+// backends, all of which slice the signal pad into world_size slots per
+// channel.
+inline void check_channel(int channel, int world_size) {
+  TORCH_CHECK(
+      channel >= 0,
+      "channel for barrier(), put_signal() and wait_signal() ",
+      "must be greater than 0 (got ",
+      channel,
+      ")");
+  const size_t num_channels =
+      get_signal_pad_size() / (sizeof(uint32_t) * world_size);
+  TORCH_CHECK(
+      static_cast<size_t>(channel) < num_channels,
+      "The maximum supported channel for barrier(), put_signal() and wait_signal() is ",
+      num_channels - 1,
+      " (got ",
+      channel,
+      ")");
+}
+
 bool device_has_multicast_support(int device_idx);
 
 bool allow_overlapping_devices();

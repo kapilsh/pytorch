@@ -1,4 +1,5 @@
 #include <dlfcn.h>
+#include <algorithm>
 #include <ATen/ceil_div.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -76,6 +77,70 @@ void nvshmemx_cumodule_init(uintptr_t module) {
   NVSHMEM_CHECK(
     ::nvshmemx_cumodule_init(cumodule),
     "nvshmemx_cumodule_init failed");
+}
+
+// Signal-pad synchronization kernels shared with the CUDA backend. See the
+// declarations in nvshmem_extension.hpp for why the launches live here rather
+// than in NVSHMEMSymmetricMemory.cpp.
+void launch_barrier_kernel(
+    void** signal_pads_dev,
+    int channel,
+    int rank,
+    int world_size,
+    size_t timeout_ms) {
+  c10d::symmetric_memory::barrier_kernel<<<
+      1,
+      std::max(at::cuda::warp_size(), world_size),
+      0,
+      at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<uint32_t**>(signal_pads_dev),
+      channel,
+      rank,
+      world_size,
+      timeout_ms);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_put_signal_kernel(
+    void** signal_pads_dev,
+    int dst_rank,
+    int channel,
+    int rank,
+    int world_size,
+    size_t timeout_ms) {
+  c10d::symmetric_memory::put_signal_kernel<<<
+      1,
+      at::cuda::warp_size(),
+      0,
+      at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<uint32_t**>(signal_pads_dev),
+      dst_rank,
+      channel,
+      rank,
+      world_size,
+      timeout_ms);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_wait_signal_kernel(
+    void** signal_pads_dev,
+    int src_rank,
+    int channel,
+    int rank,
+    int world_size,
+    size_t timeout_ms) {
+  c10d::symmetric_memory::wait_signal_kernel<<<
+      1,
+      at::cuda::warp_size(),
+      0,
+      at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<uint32_t**>(signal_pads_dev),
+      src_rank,
+      channel,
+      rank,
+      world_size,
+      timeout_ms);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 at::Tensor nvshmem_broadcast(at::Tensor& input, const int64_t root, const std::string& group_name) {

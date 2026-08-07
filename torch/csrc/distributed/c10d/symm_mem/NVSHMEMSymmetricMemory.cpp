@@ -138,11 +138,9 @@ class NVSHMEMPeerAllocInfo : public c10::intrusive_ptr_target {
     // buffer_offset. The signal pad is zeroed once in alloc(). This is one pad
     // per allocation, shared across every process group that rendezvouses on
     // it -- the same model as the CUDA backend (previously each group did its
-    // own nvshmem_malloc for an isolated pad). barrier()/put_signal()/
-    // wait_signal() are not yet implemented for NVSHMEM (see below), so nothing
-    // consumes the pad today; a future implementation must index signal slots
-    // by (rank, world_size, channel) as the CUDA backend does, so that groups
-    // with overlapping ranks on the same allocation do not clobber each other.
+    // own nvshmem_malloc for an isolated pad), and barrier()/put_signal()/
+    // wait_signal() index it by (rank, world_size, channel) exactly as the
+    // CUDA backend does.
     world_within_cuda_p2p_ = true;
     for (int r = 0; r < world_size_; ++r) {
       auto peer_base = nvshmem_ptr(base_ptr_, rank_to_global_rank[r]);
@@ -267,15 +265,38 @@ class NVSHMEMSymmetricMemory : public SymmetricMemory {
   }
 
   void barrier(int channel, size_t timeout_ms) override {
-    // TODO
+    check_signal_op("barrier", channel);
+    c10::cuda::CUDAGuard guard(device_idx_);
+    nvshmem_extension::launch_barrier_kernel(
+        pai_->signal_pads_dev_,
+        channel,
+        pai_->rank_,
+        pai_->world_size_,
+        timeout_ms);
   }
 
   void put_signal(int dst_rank, int channel, size_t timeout_ms) override {
-    // TODO
+    check_signal_op("put_signal", channel);
+    c10::cuda::CUDAGuard guard(device_idx_);
+    nvshmem_extension::launch_put_signal_kernel(
+        pai_->signal_pads_dev_,
+        dst_rank,
+        channel,
+        pai_->rank_,
+        pai_->world_size_,
+        timeout_ms);
   }
 
   void wait_signal(int src_rank, int channel, size_t timeout_ms) override {
-    // TODO
+    check_signal_op("wait_signal", channel);
+    c10::cuda::CUDAGuard guard(device_idx_);
+    nvshmem_extension::launch_wait_signal_kernel(
+        pai_->signal_pads_dev_,
+        src_rank,
+        channel,
+        pai_->rank_,
+        pai_->world_size_,
+        timeout_ms);
   }
 
   int get_rank() override {
@@ -313,6 +334,21 @@ class NVSHMEMSymmetricMemory : public SymmetricMemory {
   }
 
  private:
+  // Common validation for barrier()/put_signal()/wait_signal(). The CAS
+  // protocol these run drives every peer's signal pad with direct load-stores,
+  // which only works when `nvshmem_ptr` handed us a mapping for each peer.
+  void check_signal_op(const char* op, int channel) {
+    TORCH_CHECK(
+        pai_->world_within_cuda_p2p_,
+        "NVSHMEMSymmetricMemory::",
+        op,
+        " requires all peers to be directly accessible (NVLink / LSA domain), "
+        "but at least one peer in group '",
+        group_name_,
+        "' is reachable over the network only.");
+    check_channel(channel, pai_->world_size_);
+  }
+
   int device_idx_;
   std::string group_name_;
   c10::intrusive_ptr<NVSHMEMPeerAllocInfo> pai_;

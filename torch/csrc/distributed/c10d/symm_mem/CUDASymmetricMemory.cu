@@ -157,7 +157,7 @@ size_t CUDASymmetricMemory::get_offset() {
 }
 
 void CUDASymmetricMemory::barrier(int channel, size_t timeout_ms) {
-  check_channel(channel, world_size_, get_signal_pad_size());
+  check_channel(channel, world_size_);
   auto pg = c10d::resolve_process_group(pai_->group_name_);
   RECORD_PARAM_COMMS(
       static_cast<int64_t>(0),
@@ -186,34 +186,11 @@ void CUDASymmetricMemory::barrier(int channel, size_t timeout_ms) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-static __global__ void put_signal_kernel(
-    uint32_t** signal_pads,
-    int dst_rank,
-    int channel,
-    int rank,
-    int world_size,
-    size_t timeout_ms) {
-  if (threadIdx.x == 0) {
-    bool success = try_put_signal<std::memory_order_release>(
-        signal_pads[dst_rank] + world_size * channel + rank, timeout_ms);
-    if (!success) {
-      printf(
-          "[FATAL] CUDASymmetricMemory::put_signal: rank %d failed to send signal "
-          "to rank %d on channel %d after %lu microseconds\n",
-          rank,
-          dst_rank,
-          channel,
-          timeout_ms);
-      trap();
-    }
-  }
-}
-
 void CUDASymmetricMemory::put_signal(
     int dst_rank,
     int channel,
     size_t timeout_ms) {
-  check_channel(channel, world_size_, get_signal_pad_size());
+  check_channel(channel, world_size_);
   auto pg = c10d::resolve_process_group(pai_->group_name_);
   RECORD_PARAM_COMMS(
       static_cast<int64_t>(0),
@@ -243,39 +220,11 @@ void CUDASymmetricMemory::put_signal(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-static __global__ void wait_signal_kernel(
-    uint32_t** signal_pads,
-    int src_rank,
-    int channel,
-    int rank,
-    int world_size,
-    size_t timeout_ms) {
-  if (threadIdx.x == 0) {
-    bool success = try_wait_signal<std::memory_order_acquire>(
-        signal_pads[rank] + world_size * channel + src_rank, timeout_ms);
-    if (!success) {
-      printf(
-          "[FATAL] CUDASymmetricMemory::wait_signal rank %d failed to receive signal "
-          "from rank %d on channel %d after %lu microseconds\n",
-          rank,
-          src_rank,
-          channel,
-          timeout_ms);
-#if !defined(USE_ROCM)
-      __trap();
-#else
-      assert(0);
-#endif
-    }
-  }
-  __threadfence_system();
-}
-
 void CUDASymmetricMemory::wait_signal(
     int src_rank,
     int channel,
     size_t timeout_ms) {
-  check_channel(channel, world_size_, get_signal_pad_size());
+  check_channel(channel, world_size_);
   auto pg = c10d::resolve_process_group(pai_->group_name_);
   RECORD_PARAM_COMMS(
       static_cast<int64_t>(0),

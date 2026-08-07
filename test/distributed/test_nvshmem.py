@@ -262,6 +262,45 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         else:
             self.assertEqual(handle.multicast_ptr, 0)
 
+    def test_barrier_and_signal(self) -> None:
+        """
+        barrier()/put_signal()/wait_signal() must actually order the peers'
+        accesses to the symmetric buffer, not return as no-ops.
+        """
+        self._init_device()
+        group_name = dist.group.WORLD.group_name
+
+        numel = 1024
+        tensor = symm_mem.empty(numel, dtype=torch.float, device=self.device).fill_(-1)
+        hdl = symm_mem.rendezvous(tensor, group=group_name)
+        peer_buf = hdl.get_buffer(0, (numel,), torch.float)
+        # Baseline ordering for the initial fill_, established without the
+        # primitives under test.
+        dist.barrier()
+
+        # Point-to-point: rank 1 publishes, rank 0 consumes.
+        if self.rank == 0:
+            hdl.wait_signal(src_rank=1)
+            self.assertTrue(peer_buf.eq(42).all())
+        elif self.rank == 1:
+            peer_buf.fill_(42)
+            hdl.put_signal(dst_rank=0)
+
+        # Collective: every rank sees rank 0's write after the barrier.
+        hdl.barrier()
+        if self.rank == 0:
+            tensor.fill_(43)
+        hdl.barrier()
+        self.assertTrue(peer_buf.eq(43).all())
+        # Nobody may free the buffer while a peer is still reading it.
+        hdl.barrier()
+
+        # Channels must be bounds-checked, as on the other backends.
+        max_channel = hdl.signal_pad_size // 4 // self.world_size
+        with self.assertRaisesRegex(RuntimeError, "maximum supported channel"):
+            hdl.barrier(channel=max_channel)
+        torch.cuda.synchronize()
+
     def test_nvshmem_put(self) -> None:
         self._init_device()
         group_name = dist.group.WORLD.group_name
@@ -290,19 +329,21 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         dtype = torch.float
         numel = 1024
         tensor = symm_mem.empty(numel, dtype=dtype, device=self.device).fill_(self.rank)
-        symm_mem.rendezvous(tensor, group=group_name)
+        hdl = symm_mem.rendezvous(tensor, group=group_name)
+        # Make rank 1's fill_ visible before rank 0 pulls from it.
+        hdl.barrier()
 
         if self.rank == 0:
             torch.ops.symm_mem.nvshmem_get(tensor, 1)
-            # TODO: remove after we have wait_signal
-            dist.barrier()
+            # Tell rank 1 that its buffer is no longer being read.
+            hdl.put_signal(dst_rank=1)
             torch.testing.assert_close(
                 tensor, torch.ones(numel, dtype=dtype, device=self.device)
             )
-        else:
-            # handle.wait_signal(src_rank=0)
-            # TODO: remove after we have wait_signal
-            dist.barrier()
+        elif self.rank == 1:
+            hdl.wait_signal(src_rank=0)
+
+        hdl.barrier()
 
     @skip_but_pass_in_sandcastle_if(
         TEST_WITH_ROCM, "nvshmem_get_out not yet implemented for ROCm"

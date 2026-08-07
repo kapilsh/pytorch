@@ -90,4 +90,32 @@ void multi_root_tile_reduce(
     std::string group_name,
     std::string reduce_op = "sum");
 
+// Launchers for the signal-pad synchronization kernels that NVSHMEMSymmetric-
+// Memory shares with the CUDA backend. They live here because
+// NVSHMEMSymmetricMemory.cpp is deliberately compiled as host C++ (nvcc's
+// frontend crashes on it, see #175616) and so cannot launch kernels itself;
+// nvshmem_extension.cu and rocshmem_extension.cu provide the definitions.
+void launch_barrier_kernel(
+    void** signal_pads_dev,
+    int channel,
+    int rank,
+    int world_size,
+    size_t timeout_ms);
+
+void launch_put_signal_kernel(
+    void** signal_pads_dev,
+    int dst_rank,
+    int channel,
+    int rank,
+    int world_size,
+    size_t timeout_ms);
+
+void launch_wait_signal_kernel(
+    void** signal_pads_dev,
+    int src_rank,
+    int channel,
+    int rank,
+    int world_size,
+    size_t timeout_ms);
+
 } // namespace c10d::nvshmem_extension
