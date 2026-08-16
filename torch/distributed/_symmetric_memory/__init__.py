@@ -2211,16 +2211,22 @@ def empty(  # type: ignore[misc]
     else:
         device = torch.device(device)
 
-    stride = torch._prims_common.make_contiguous_strides_for(size)
-
     if _should_use_implicit_mempool() and device.type == "cuda":
-        # Allocate tensor from an implicit memory pool
-        mempool = get_mem_pool(device)
+        # Allocate from the implicit memory pool. This has to go through
+        # `torch.empty()`: `empty_strided_p2p()` calls the symmetric allocator
+        # directly, bypassing the caching allocator that the pool is attached
+        # to, so it would map a fresh region on every call and the surrounding
+        # `use_mem_pool` context would do nothing.
+        # `use_mem_pool` defaults to the *current* device rather than the pool's,
+        # so pass `device` explicitly -- otherwise a request for a non-current
+        # device would silently allocate outside the pool, yielding a tensor
+        # that is not symmetric memory at all.
         # TODO: this path can be made device-agnostic if `use_mem_pool` is
         # elevated from torch.cuda to torch accelerator.
-        with torch.cuda.use_mem_pool(mempool):
-            return _SymmetricMemory.empty_strided_p2p(size, stride, dtype, device)
+        with torch.cuda.use_mem_pool(get_mem_pool(device), device=device):
+            return torch.empty(size, dtype=dtype, device=device)
     else:
+        stride = torch._prims_common.make_contiguous_strides_for(size)
         return _SymmetricMemory.empty_strided_p2p(size, stride, dtype, device)
 
 

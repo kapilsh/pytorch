@@ -2648,8 +2648,39 @@ class SymmMemPoolTest(MultiProcContinuousTest):
         not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
     )
     @skip_if_lt_x_gpu(2)
+    def test_symm_mem_empty_uses_implicit_pool(self):
+        """symm_mem.empty() allocates from the implicit MemPool, so it recycles."""
+        self._init_process()
+        group_name = dist.group.WORLD.group_name
+        numel, dtype = 1024, torch.float
+
+        t1 = symm_mem.empty(numel, dtype=dtype, device=self.device)
+        self.assertTrue(symm_mem.is_symm_mem_tensor(t1))
+        ptr1 = t1.data_ptr()
+        del t1
+
+        t2 = symm_mem.empty(numel, dtype=dtype, device=self.device)
+        self.assertEqual(
+            ptr1,
+            t2.data_ptr(),
+            "symm_mem.empty() should recycle storage through the implicit MemPool",
+        )
+
+        # The recycled allocation must still rendezvous and carry data.
+        hdl = symm_mem.rendezvous(t2, group=group_name)
+        t2.fill_(self.rank)
+        hdl.barrier(timeout_ms=60000)
+        for peer in range(self.world_size):
+            self.assertTrue(hdl.get_buffer(peer, (numel,), dtype).eq(peer).all())
+        hdl.barrier(timeout_ms=60000)
+
+    @skipIf(TEST_WITH_ROCM, "https://github.com/pytorch/pytorch/issues/180464")
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
     def test_symm_mem_empty_storage_reuse(self):
-        """symm_mem.empty() reuses storage across alloc/free cycles via the MemPool."""
+        """empty_strided_p2p() with an alloc_id reuses the same storage."""
         self._init_process()
 
         size = (1024,)
