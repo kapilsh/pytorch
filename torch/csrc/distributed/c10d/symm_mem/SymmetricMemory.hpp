@@ -223,6 +223,23 @@ TORCH_API size_t get_signal_pad_size();
 // and the world size.
 TORCH_API void set_signal_pad_size(size_t size);
 
+// Byte offset from an allocation's base to the start of its data buffer; the
+// signal pad occupies [0, get_buffer_offset()).
+//
+// NOTE [symmetric memory buffer offset is process-global]
+// Once the first allocation is made the signal pad size is frozen (see
+// freeze_signal_pad_size), so this offset is the same for every live
+// allocation. That is what lets a pointer lookup recover an allocation's data
+// pointer from its base as `alloc_base + get_buffer_offset()` instead of
+// consulting per-allocation metadata.
+TORCH_API size_t get_buffer_offset();
+
+// Freeze the signal pad size, making subsequent set_signal_pad_size() calls
+// that would change it an error. Backends must call this before laying out an
+// allocation, so that get_buffer_offset() stays constant while the allocation
+// is live.
+TORCH_API void freeze_signal_pad_size();
+
 C10_EXPORT void register_mempool_allocator(
     c10::DeviceType device_type,
     std::shared_ptr<c10::Allocator> allocator);

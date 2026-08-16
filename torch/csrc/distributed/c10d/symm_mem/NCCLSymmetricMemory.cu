@@ -505,8 +505,10 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
     // single window is registered over the whole region at rendezvous time, so
     // only the base pointer (already granularity-aligned by ncclMemAlloc) needs
     // to satisfy NCCL's window-alignment requirement.
-    const size_t buffer_offset =
-        at::round_up(get_signal_pad_size(), signal_pad_alignment);
+    // Freeze the pad size first: buffer_offset is baked into this allocation's
+    // layout for as long as the allocation is live.
+    freeze_signal_pad_size();
+    const size_t buffer_offset = get_buffer_offset();
     const size_t aligned_buffer_size = at::round_up(size, 16UL);
     const size_t total_size = buffer_offset + aligned_buffer_size;
     void* alloc_base;

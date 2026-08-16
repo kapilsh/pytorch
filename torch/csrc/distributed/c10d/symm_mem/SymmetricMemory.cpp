@@ -3,6 +3,8 @@
 
 #include <torch/custom_class.h>
 
+#include <ATen/ceil_div.h>
+
 #include <atomic>
 #include <mutex>
 
@@ -24,6 +26,10 @@ static bool is_finalizing_ = false;
 // A value of 0 indicates "not set" (use default).
 // Using std::atomic for thread safety when accessed from C++ without GIL.
 static std::atomic<size_t> configured_signal_pad_size_{0};
+
+// Set by freeze_signal_pad_size() once a backend lays out its first
+// allocation. See NOTE [symmetric memory buffer offset is process-global].
+static std::atomic<bool> any_allocation_made_{false};
 
 // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
 class AllocatorMap {
@@ -221,7 +227,26 @@ size_t get_signal_pad_size() {
 }
 
 void set_signal_pad_size(size_t size) {
+  // Mirror set_backend: re-setting the size to what it already is is a no-op
+  // and stays legal even after allocations exist.
+  if (size == get_signal_pad_size()) {
+    return;
+  }
+  TORCH_CHECK(
+      !any_allocation_made_.load(std::memory_order_acquire),
+      "set_signal_pad_size must be called before any symmetric memory "
+      "allocation is made. The signal pad size determines the offset of the "
+      "data buffer within an allocation, which is baked into every live "
+      "allocation's layout, so it cannot change once allocations exist.");
   configured_signal_pad_size_.store(size, std::memory_order_release);
+}
+
+size_t get_buffer_offset() {
+  return at::round_up(get_signal_pad_size(), signal_pad_alignment);
+}
+
+void freeze_signal_pad_size() {
+  any_allocation_made_.store(true, std::memory_order_release);
 }
 
 bool has_allocator(c10::DeviceType device_type) {

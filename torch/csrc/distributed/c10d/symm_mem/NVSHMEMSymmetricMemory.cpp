@@ -407,9 +407,11 @@ class NVSHMEMSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
         group->getStore(), group->getRank(), group->getSize(), device_idx);
 
     // Signal pad first at [0, buffer_offset), data buffer at buffer_offset,
-    // which is the signal pad size rounded up to signal_pad_alignment.
-    const size_t buffer_offset =
-        at::round_up(get_signal_pad_size(), signal_pad_alignment);
+    // which is the signal pad size rounded up to signal_pad_alignment. Freeze
+    // it first: it is baked into this allocation's layout for as long as the
+    // allocation is live.
+    freeze_signal_pad_size();
+    const size_t buffer_offset = get_buffer_offset();
     const size_t total_size = buffer_offset + at::round_up(size, 16UL);
     auto alloc_base = nvshmem_malloc(total_size);
     TORCH_CHECK(alloc_base != nullptr, "nvshmem_malloc failed");
