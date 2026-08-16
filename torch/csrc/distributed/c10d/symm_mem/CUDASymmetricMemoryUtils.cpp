@@ -359,4 +359,32 @@ void map_block(
 #endif
 }
 
+void* get_allocation_base(void* ptr) {
+  // A failed query is not an error here: callers pass pointers that may not
+  // belong to a symmetric allocation at all (e.g. a plain caching-allocator
+  // tensor handed to rendezvous()), and the driver reports that as
+  // CUDA_ERROR_INVALID_VALUE. Report it as "unknown base" and let the caller
+  // raise the user-facing error.
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+  auto driver_api = c10::cuda::DriverAPI::get();
+  CUdeviceptr base = 0;
+  size_t size = 0;
+  if (driver_api->cuMemGetAddressRange_(
+          &base, &size, reinterpret_cast<CUdeviceptr>(ptr)) != CUDA_SUCCESS) {
+    return nullptr;
+  }
+  return reinterpret_cast<void*>(base);
+#elif defined(USE_ROCM)
+  hipDeviceptr_t base = nullptr;
+  size_t size = 0;
+  if (hipMemGetAddressRange(
+          &base, &size, reinterpret_cast<hipDeviceptr_t>(ptr)) != hipSuccess) {
+    return nullptr;
+  }
+  return reinterpret_cast<void*>(base);
+#else
+  return nullptr;
+#endif
+}
+
 } // namespace c10d::symmetric_memory

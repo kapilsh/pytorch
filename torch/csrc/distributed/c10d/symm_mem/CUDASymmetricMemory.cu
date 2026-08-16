@@ -1029,30 +1029,39 @@ c10::intrusive_ptr<Block> CUDASymmetricMemoryAllocator::find_block(void* ptr) {
   return it->second;
 }
 
-/* Search for a block that covers the given ptr, and write back the offset to
- * the base ptr; error out if not found */
+/* Search for the block whose data buffer covers the given ptr, and write back
+ * the offset of ptr within that buffer; returns nullptr if not found. */
 c10::intrusive_ptr<Block> CUDASymmetricMemoryAllocator::find_block_covering(void* ptr, size_t& offset) {
   std::shared_lock lock(mutex_);
-  // In case of MemPool, tensor.storage().data_ptr() may not match
-  // exactly an allocation's base address. Thus we perform the search by
-  // testing if the former is within an allocation's range.
-  auto alloc_it = std::find_if(ptr_to_block_.begin(), ptr_to_block_.end(),
-                             [&](const auto& pair){
-                                auto& block = pair.second;
-                                auto ptr_int = reinterpret_cast<uintptr_t>(ptr);
-                                // pair.first is buffer_ptr, the key alloc()
-                                // stored (alloc_base + buffer_offset), i.e. the
-                                // data buffer start past the signal pad.
-                                auto buffer_ptr = reinterpret_cast<uintptr_t>(pair.first);
-                                // Modify offset so that it is returned
-                                offset = ptr_int - buffer_ptr;
-                                return ptr_int >= buffer_ptr && offset < block->buffer_size; });
-
-  if (alloc_it == ptr_to_block_.end()) {
+  // Fast path: `ptr` is exactly the data pointer alloc() returned and keyed on.
+  // Direct empty_strided_p2p() allocations and the no_split MemPool both land
+  // here, so they never pay for a driver query.
+  if (auto it = ptr_to_block_.find(ptr); it != ptr_to_block_.end()) {
+    offset = 0;
+    return it->second;
+  }
+  // Interior pointer -- a MemPool-split segment or a user-sliced tensor.
+  // Recover the allocation base from the driver and rebuild the key alloc()
+  // stored. This is sound because the offset from the base to the data buffer
+  // is the same for every live allocation; see NOTE [symmetric memory buffer
+  // offset is process-global].
+  void* alloc_base = get_allocation_base(ptr);
+  if (alloc_base == nullptr) {
     return nullptr;
   }
-
-  return alloc_it->second;
+  void* buffer_ptr = static_cast<char*>(alloc_base) + get_buffer_offset();
+  auto it = ptr_to_block_.find(buffer_ptr);
+  if (it == ptr_to_block_.end()) {
+    return nullptr;
+  }
+  // Rejects a ptr that lands in the signal pad, where the subtraction wraps.
+  size_t candidate_offset = reinterpret_cast<uintptr_t>(ptr) -
+      reinterpret_cast<uintptr_t>(buffer_ptr);
+  if (candidate_offset >= it->second->buffer_size) {
+    return nullptr;
+  }
+  offset = candidate_offset;
+  return it->second;
 }
 
 bool CUDASymmetricMemoryAllocator::has_allocation(void* ptr) {

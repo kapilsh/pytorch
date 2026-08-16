@@ -2604,6 +2604,50 @@ class SymmMemPoolTest(MultiProcContinuousTest):
         not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
     )
     @skip_if_lt_x_gpu(2)
+    def test_mempool_split_interior_pointer(self):
+        """rendezvous() resolves a pointer interior to a split segment."""
+        self._init_process()
+        group_name = dist.group.WORLD.group_name
+
+        # The pool from get_mem_pool() sets no_split=True, so every tensor
+        # starts at an allocation base and only exercises the exact-match
+        # lookup. Build a splitting pool so the caching allocator carves more
+        # than one tensor out of a single symmetric allocation.
+        allocator = symm_mem.get_mempool_allocator(self.device)
+        pool = torch.cuda.MemPool(allocator, use_on_oom=False, no_split=False)
+
+        numel, dtype = 1024, torch.float
+        itemsize = torch.empty(0, dtype=dtype).element_size()
+
+        with torch.cuda.use_mem_pool(pool):
+            seed = torch.empty(numel * 4, dtype=dtype, device=self.device)
+        base_ptr = seed.data_ptr()
+        del seed
+
+        with torch.cuda.use_mem_pool(pool):
+            first = torch.empty(numel, dtype=dtype, device=self.device)
+            second = torch.empty(numel, dtype=dtype, device=self.device)
+
+        if first.data_ptr() != base_ptr or second.data_ptr() == base_ptr:
+            self.skipTest("caching allocator did not split the symmetric segment")
+
+        # `second` is interior to the allocation, so rendezvous has to recover
+        # the allocation base rather than hitting the exact-match fast path.
+        hdl = symm_mem.rendezvous(second, group=group_name)
+        self.assertEqual(hdl.offset, second.data_ptr() - base_ptr)
+
+        second.fill_(self.rank)
+        hdl.barrier(timeout_ms=60000)
+        for peer in range(self.world_size):
+            buf = hdl.get_buffer(peer, (numel,), dtype, hdl.offset // itemsize)
+            self.assertTrue(buf.eq(peer).all())
+        hdl.barrier(timeout_ms=60000)
+
+    @skipIf(TEST_WITH_ROCM, "https://github.com/pytorch/pytorch/issues/180464")
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
     def test_symm_mem_empty_storage_reuse(self):
         """symm_mem.empty() reuses storage across alloc/free cycles via the MemPool."""
         self._init_process()
