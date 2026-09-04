@@ -214,6 +214,7 @@ at::Tensor multimem_all_reduce_(
       "multimem_all_reduce_: only sum is supported for now.");
 
   auto symm_mem = c10d::symmetric_memory::rendezvous(input, group_name);
+  auto stream_lock = guard_pad_stream(symm_mem);
   TORCH_CHECK(
       symm_mem != nullptr,
       "multimem_all_reduce_: input must be allocated with empty_strided_p2p().");
@@ -314,6 +315,7 @@ at::Tensor multimem_one_shot_reduce_out(
       "multimem_one_shot_reduce: only sum is supported for now.");
 
   auto symm_mem = c10d::symmetric_memory::rendezvous(input, group_name);
+  auto stream_lock = guard_pad_stream(symm_mem);
   TORCH_CHECK(
       symm_mem != nullptr,
       "multimem_one_shot_reduce: input must be allocated with empty_strided_p2p().");
@@ -435,6 +437,7 @@ at::Tensor multimem_all_gather_out(
       -1,
       pg->getSize());
   auto symm_mem = c10d::symmetric_memory::rendezvous(out, group_name);
+  auto stream_lock = guard_pad_stream(symm_mem);
   TORCH_CHECK(
       symm_mem != nullptr,
       "multimem_all_gather_out: output must be allocated with empty_strided_p2p().");
@@ -649,6 +652,7 @@ at::Tensor one_shot_all_reduce_out_impl(
     return out;
   }
   auto symm_mem = c10d::symmetric_memory::rendezvous(input, group_name);
+  auto stream_lock = guard_pad_stream(symm_mem);
   TORCH_CHECK(
       symm_mem != nullptr,
       "one_shot_all_reduce: input must be allocated with empty_strided_p2p().");
@@ -902,6 +906,7 @@ at::Tensor two_shot_all_reduce_impl(
       "two_shot_all_reduce: only sum is supported for now.");
 
   auto symm_mem = c10d::symmetric_memory::rendezvous(input, group_name);
+  auto stream_lock = guard_pad_stream(symm_mem);
   TORCH_CHECK(
       symm_mem != nullptr,
       "two_shot_all_reduce: input must be allocated with empty_strided_p2p().");
@@ -1040,6 +1045,7 @@ at::Tensor reduce_scatter_out(
       output.is_contiguous(), "reduce_scatter: output must be contiguous.");
 
   auto symm_mem = c10d::symmetric_memory::rendezvous(input, group_name);
+  auto stream_lock = guard_pad_stream(symm_mem);
   TORCH_CHECK(
       symm_mem != nullptr,
       "reduce_scatter: input must be allocated with empty_strided_p2p().");

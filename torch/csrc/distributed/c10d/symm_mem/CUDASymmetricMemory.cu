@@ -9,6 +9,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/PeerToPeerAccess.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAEvent.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/env.h>
 #include <c10/util/error.h>
@@ -27,6 +29,61 @@
 #endif
 
 namespace c10d::symmetric_memory {
+
+// NOTE [signal pad stream serialization]
+// The signal pad is shared mutable device state, and every built-in primitive
+// assumes it is zero-filled between successful synchronizations: a producer
+// spins until it can set a slot, a consumer spins until it observes the slot
+// set and then clears it. The kernels launch on the current CUDA stream, so
+// driving one pad from two streams puts two independent producer/consumer
+// sequences on the same slots and they steal each other's signals.
+//
+// Serialize instead: before touching the pad, the current stream waits for
+// whichever stream touched it last, so pad-mutating kernels exist on at most
+// one stream at a time. The lock is held by the caller across the kernel
+// launch -- establishing the dependency and enqueueing the work must be
+// atomic, or two CPU threads can interleave and order the streams wrongly.
+//
+// This removes the race. It does not make cross-stream synchronization
+// correct: both streams still use the same channel, so signals are still
+// matched positionally and ranks that issue their pad ops in different orders
+// will still mispair. Distinct channels remain the mechanism for that.
+std::unique_lock<std::mutex> CUDAPeerAllocInfo::guard_stream() {
+  std::unique_lock<std::mutex> lock(stream_mu_);
+  // Under graph capture the graph's own edges provide the ordering, and an
+  // event recorded here would not replay.
+  if (c10::cuda::currentStreamCaptureStatusMayInitCtx() !=
+      c10::cuda::CaptureStatus::None) {
+    return lock;
+  }
+  auto cur = c10::cuda::getCurrentCUDAStream(
+      static_cast<c10::DeviceIndex>(local_device_idx_));
+  if (last_stream_.has_value() && *last_stream_ != cur) {
+    // Stack-local on purpose. cudaEventDestroy on an event with pending work
+    // is legal (it frees on completion), and this way nothing owns a
+    // CUDAEvent past CUDA shutdown -- ~CUDAEvent builds a CUDAGuard whose
+    // ctor throws cudaErrorCudartUnloading during teardown, which would
+    // escape a noexcept destructor and call std::terminate.
+    c10::cuda::CUDAEvent ev;
+    ev.record(*last_stream_);
+    ev.block(cur);
+  }
+  last_stream_ = cur;
+  return lock;
+}
+
+std::unique_lock<std::mutex> CUDASymmetricMemory::guard_stream() {
+  return pai_->guard_stream();
+}
+
+std::unique_lock<std::mutex> guard_pad_stream(
+    const c10::intrusive_ptr<SymmetricMemory>& mem) {
+  auto* cuda_mem = dynamic_cast<CUDASymmetricMemory*>(mem.get());
+  if (cuda_mem == nullptr) {
+    return {};
+  }
+  return cuda_mem->guard_stream();
+}
 
 /* Start of CUDASymmetricMemory implementation */
 
@@ -83,8 +140,10 @@ CUDAPeerAllocInfo::CUDAPeerAllocInfo(
     int local_device_idx,
     int rank,
     int world_size,
-    std::string group_name)
-    : alloc_refs_(std::move(alloc_refs)),
+    std::string group_name,
+    size_t pad_slot)
+    : pad_slot_(pad_slot),
+      alloc_refs_(std::move(alloc_refs)),
       buffers_(std::move(buffers)),
       signal_pads_(std::move(signal_pads)),
       mc_signal_pad_addr_(mc_signal_pad_addr),
@@ -186,6 +245,7 @@ void CUDASymmetricMemory::barrier(int channel, size_t timeout_ms) {
       -1,
       world_size_);
   c10::cuda::CUDAGuard device_guard(local_device_idx_);
+  auto stream_lock = guard_stream();
   if (get_multicast_ptr() != nullptr) {
     multimem_barrier_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
         static_cast<uint32_t*>(pai_->signal_pads_[rank_]),
@@ -231,6 +291,7 @@ void CUDASymmetricMemory::put_signal(
       -1,
       world_size_);
   c10::cuda::CUDAGuard device_guard(local_device_idx_);
+  auto stream_lock = guard_stream();
   put_signal_kernel<<<
       1,
       at::cuda::warp_size(),
@@ -266,6 +327,7 @@ void CUDASymmetricMemory::wait_signal(
       -1,
       world_size_);
   c10::cuda::CUDAGuard device_guard(local_device_idx_);
+  auto stream_lock = guard_stream();
   wait_signal_kernel<<<
       1,
       at::cuda::warp_size(),
@@ -326,10 +388,11 @@ void* CUDASymmetricMemoryAllocator::alloc(
     size_t size,
     int device_idx,
     const std::optional<std::string>& group_name) {
-  // buffer_offset is the signal pad size rounded up to signal_pad_alignment so
-  // the data buffer stays aligned.
-  size_t buffer_offset =
-      at::round_up(get_signal_pad_size(), signal_pad_alignment);
+  // buffer_offset is the whole signal pad region -- kSignalPadGroupSlots
+  // slices, one per process group (see NOTE [per-process-group signal pad]) --
+  // rounded up to signal_pad_alignment so the data buffer stays aligned.
+  size_t buffer_offset = at::round_up(
+      get_signal_pad_size() * kSignalPadGroupSlots, signal_pad_alignment);
   size_t block_size = buffer_offset + at::round_up(size, 16UL);
   c10::cuda::CUDAGuard guard(device_idx);
   device_idx = static_cast<int>(guard.current_device().index());
@@ -450,6 +513,9 @@ struct RendezvousRequest {
   size_t buffer_offset;
   bool has_multicast_support;
   int clique_id;
+  // Bitmask of this allocation's signal pad slices already held by other
+  // process groups on this rank. See NOTE [per-process-group signal pad].
+  uint64_t taken_pad_slots;
   char hostname[HOST_NAME_MAX + 1];
 };
 
@@ -755,7 +821,14 @@ c10::intrusive_ptr<CUDAPeerAllocInfo> make_peer_alloc_info(
       .buffer_size = block->buffer_size,
       .buffer_offset = block->buffer_offset,
       .has_multicast_support = device_has_multicast_support(block->device_idx),
-      .clique_id = at::cuda::get_fabric_clique_id(block->device_idx)};
+      .clique_id = at::cuda::get_fabric_clique_id(block->device_idx),
+      .taken_pad_slots = [&] {
+        uint64_t mask = 0;
+        for (const auto& entry : block->symm_mems) {
+          mask |= (1ULL << entry.second->pad_slot());
+        }
+        return mask;
+      }()};
 
   // Populate hostname field for host identification
   gethostname(local_req.hostname, sizeof(local_req.hostname));
@@ -783,6 +856,25 @@ c10::intrusive_ptr<CUDAPeerAllocInfo> make_peer_alloc_info(
         ? pg_all_gather(group, block->device_idx, block_handle)
         : storeExchange.all_gather(store, rank, world_size, block_handle);
   }
+
+  // Pick this group's pad slice: the lowest slot free on every member. The
+  // masks rode along on the RendezvousRequest allgather above, so this costs
+  // no extra collective. See NOTE [per-process-group signal pad].
+  uint64_t taken = 0;
+  for (const auto& req : reqs) {
+    taken |= req.taken_pad_slots;
+  }
+  size_t pad_slot = 0;
+  while (pad_slot < kSignalPadGroupSlots && (taken & (1ULL << pad_slot)) != 0) {
+    ++pad_slot;
+  }
+  TORCH_CHECK(
+      pad_slot < kSignalPadGroupSlots,
+      "CUDASymmetricMemory: this allocation is already rendezvous'd into ",
+      kSignalPadGroupSlots,
+      " process groups, which is the number of signal pad slices reserved "
+      "per allocation. Raise kSignalPadGroupSlots or use separate "
+      "allocations for additional groups.");
 
   std::vector<HandleType> handles(world_size);
   // signal_pads[r] is peer r's mapped base (the signal pad lives at the base,
@@ -880,9 +972,18 @@ c10::intrusive_ptr<CUDAPeerAllocInfo> make_peer_alloc_info(
         signal_pads[r], handles[r], block->block_size, block->device_idx));
   }
 
-  // The multicast mapping mirrors the block layout: the signal pad is at the
-  // base and the data buffer lives at buffer_offset within it.
-  void* mc_signal_pad_addr = mc_addr;
+  // Now that every AllocationRef owns the mapped *base*, move the pad pointers
+  // onto this group's slice. Everything downstream -- kernels, get_signal_pad()
+  // -- then works unchanged and simply cannot see another group's slice.
+  const size_t pad_shift = pad_slot * get_signal_pad_size();
+  for (auto& pad : signal_pads) {
+    pad = static_cast<char*>(pad) + pad_shift;
+  }
+
+  // The multicast mapping mirrors the block layout: the signal pad region is at
+  // the base and the data buffer lives at buffer_offset within it.
+  void* mc_signal_pad_addr =
+      mc_addr != nullptr ? static_cast<char*>(mc_addr) + pad_shift : nullptr;
   void* mc_buffer_addr = mc_addr != nullptr
       ? static_cast<char*>(mc_addr) + block->buffer_offset
       : nullptr;
@@ -898,7 +999,8 @@ c10::intrusive_ptr<CUDAPeerAllocInfo> make_peer_alloc_info(
       block->device_idx,
       rank,
       world_size,
-      group_name);
+      group_name,
+      pad_slot);
 
   return pai;
 }

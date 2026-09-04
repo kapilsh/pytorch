@@ -2,13 +2,37 @@
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAAllocatorConfig.h>
+#include <c10/cuda/CUDAStream.h>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryTypes.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
 
 namespace c10d::symmetric_memory {
+
+// NOTE [per-process-group signal pad]
+// One allocation can be rendezvous'd into several process groups, and each
+// gets its own `CUDAPeerAllocInfo`. They must not share signal pad bytes: the
+// barrier slot address is `world_size * channel + rank`, computed with the
+// *group-local* world size and rank, so two groups over one pad compute
+// overlapping addresses out of unrelated numbering and silently corrupt each
+// other.
+//
+// So the pad region reserved at the front of every allocation holds
+// `kSignalPadGroupSlots` slices of `get_signal_pad_size()` bytes, and each
+// group takes one slice. `get_signal_pad_size()` keeps meaning the size of a
+// single group's pad, so the channel count per group is unchanged.
+//
+// The slice index has to be agreed across the group -- peers address my pad as
+// `signal_pads[me] + slot * slice`, so a rank that picked a different slot
+// would write into the wrong slice. Groups can also be registered in different
+// orders on different ranks, so it cannot be a local counter. It is chosen
+// during rendezvous by all-gathering each member's locally-taken slots and
+// taking the lowest one free everywhere.
+constexpr size_t kSignalPadGroupSlots = 4;
 
 // Resource wrapper that owns a (vaddr, allocation handle) pair. Upon
 // destruction, it unmaps the vaddr and releases the allocation handle.
@@ -57,6 +81,10 @@ class CUDASymmetricMemory : public SymmetricMemory {
   void put_signal(int dst_rank, int channel, size_t timeout_ms) override;
   void wait_signal(int src_rank, int channel, size_t timeout_ms) override;
 
+  // See NOTE [signal pad stream serialization]. Hold the returned lock across
+  // the kernel launch.
+  [[nodiscard]] std::unique_lock<std::mutex> guard_stream();
+
   int get_rank() override;
   int get_world_size() override;
   c10::Device get_device() override;
@@ -88,9 +116,27 @@ class CUDAPeerAllocInfo : public c10::intrusive_ptr_target {
       int local_device_idx,
       int rank,
       int world_size,
-      std::string group_name);
+      std::string group_name,
+      size_t pad_slot);
+
+  // See NOTE [signal pad stream serialization]. Lives here, not on
+  // `CUDASymmetricMemory`, because one `CUDAPeerAllocInfo` owns exactly one
+  // signal pad slice: every handle sharing this object shares that slice and
+  // must share one serialization point, while other allocations -- and, per
+  // NOTE [per-process-group signal pad], other groups over this allocation --
+  // own different slices and must stay independent of each other.
+  [[nodiscard]] std::unique_lock<std::mutex> guard_stream();
+
+  // Which slice of the allocation's pad region this group holds.
+  size_t pad_slot() const {
+    return pad_slot_;
+  }
 
  private:
+  std::mutex stream_mu_;
+  std::optional<c10::cuda::CUDAStream> last_stream_;
+  size_t pad_slot_;
+
   std::vector<c10::intrusive_ptr<AllocationRef>> alloc_refs_;
   std::vector<void*> buffers_;
   std::vector<void*> signal_pads_;
@@ -107,6 +153,12 @@ class CUDAPeerAllocInfo : public c10::intrusive_ptr_target {
 
   friend class CUDASymmetricMemory;
 };
+
+// Serializes signal-pad access for the collective entry points, which hold a
+// base-class pointer. Returns an empty lock (a no-op) for backends other than
+// the CUDA one, whose primitives do not use this pad protocol.
+[[nodiscard]] std::unique_lock<std::mutex> guard_pad_stream(
+    const c10::intrusive_ptr<SymmetricMemory>& mem);
 
 // Metadata associated with each allocation performed by
 // `CUDASymmetricMemoryAllocator`.
