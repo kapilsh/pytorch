@@ -12,6 +12,7 @@ from typing import Literal
 import cuda.bindings.driver as cudadrv
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir import ir
 from cutlass.cute.runtime import make_ptr
 
 import torch
@@ -87,6 +88,13 @@ _LINE_BYTES = 16
 
 _FP32, _BF16, _FP16 = 0, 1, 2
 _DTYPE_CODE = {torch.float32: _FP32, torch.bfloat16: _BF16, torch.float16: _FP16}
+_ELEM_TYPE = {_FP32: F32, _BF16: cutlass.BFloat16, _FP16: cutlass.Float16}
+# bit pattern of -0.0, compared on an unsigned view of the element width
+_NEG_ZERO_BITS = {
+    _FP32: (U32, 0x80000000),
+    _BF16: (cutlass.Uint16, 0x8000),
+    _FP16: (cutlass.Uint16, 0x8000),
+}
 
 _LL_ONE_SHOT, _LL_TWO_SHOT, _LAMPORT_ONE_SHOT, _LAMPORT_TWO_SHOT = range(4)
 _KERNEL_KIND = {
@@ -100,161 +108,95 @@ _KERNEL_KIND = {
 _STATE_NUMEL = 8
 
 
-# ---- PTX primitives -------------------------------------------------------------
+# ---- memory ops -----------------------------------------------------------------
+# A 16 B line is a (4,) vector of u32 words. Inbox traffic uses relaxed system-scope
+# vector loads/stores so a spinning reader always sees fresh data; the input goes
+# through the read-only cache and the output uses plain stores.
 
 
-def _ptr(addr):
-    return cute.make_ptr(U32, addr, _GMEM)
+def _ptr(addr, align):
+    return cute.make_ptr(U32, addr, _GMEM, assumed_align=align)
 
 
-def _line_ptr(base, line):
-    return _ptr(base + I64(line) * _LINE_BYTES)
+def _line_addr(base, line):
+    return base + I64(line) * _LINE_BYTES
 
 
-def _st_v4(ptr, w0, w1, w2, w3):
-    cute.arch.inline_ptx(
-        "st.relaxed.sys.global.v4.u32 [{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}};",
-        read_only_args=[ptr, w0, w1, w2, w3],
+def _load(addr, n, **order):
+    """Load `n` u32 words from a 4 * n B aligned address as a vector."""
+    vec = ir.VectorType.get([n], U32.mlir_type)
+    return cute.TensorSSA(cute.arch.load(_ptr(addr, 4 * n), vec, **order), (n,), U32)
+
+
+def _ld_input(addr, n):
+    """Load `n` input words through the read-only (non-coherent) cache."""
+    # inline PTX: cute.arch.load has no .nc variant
+    regs = ", ".join(f"{{$w{k}}}" for k in range(n))
+    vals = cute.arch.inline_ptx(
+        f"ld.global.nc.v{n}.u32 {{{regs}}}, [{{$r0}}];",
+        write_only_types=[U32] * n,
+        read_only_args=[_ptr(addr, 4 * n)],
     )
+    return _words(*vals)
 
 
-def _st_v4_mc(ptr, w0, w1, w2, w3):
-    cute.arch.inline_ptx(
-        "multimem.st.relaxed.sys.global.v4.f32 [{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}};",
-        read_only_args=[ptr, w0, w1, w2, w3],
-    )
+def _store(addr, words, **order):
+    cute.arch.store(_ptr(addr, 4 * words.shape[0]), words.ir_value(), **order)
 
 
-def _ld_v4(ptr):
-    return cute.arch.inline_ptx(
-        "ld.relaxed.sys.global.v4.u32 {{$w0}, {$w1}, {$w2}, {$w3}}, [{$r0}];",
-        write_only_types=[U32, U32, U32, U32],
-        read_only_args=[ptr],
-    )
+def _ld_line(base, line):
+    return _load(_line_addr(base, line), 4, sem="relaxed", scope="sys")
 
 
-def _ld_nc_v2(ptr):
-    return cute.arch.inline_ptx(
-        "ld.global.nc.v2.u32 {{$w0}, {$w1}}, [{$r0}];",
-        write_only_types=[U32, U32],
-        read_only_args=[ptr],
-    )
-
-
-def _ld_nc_v4(ptr):
-    return cute.arch.inline_ptx(
-        "ld.global.nc.v4.u32 {{$w0}, {$w1}, {$w2}, {$w3}}, [{$r0}];",
-        write_only_types=[U32, U32, U32, U32],
-        read_only_args=[ptr],
-    )
-
-
-def _st_out_v2(ptr, w0, w1):
-    cute.arch.inline_ptx(
-        "st.global.v2.u32 [{$r0}], {{$r1}, {$r2}};", read_only_args=[ptr, w0, w1]
-    )
-
-
-def _st_out_v4(ptr, w0, w1, w2, w3):
-    cute.arch.inline_ptx(
-        "st.global.v4.u32 [{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}};",
-        read_only_args=[ptr, w0, w1, w2, w3],
-    )
+def _words(*vals):
+    """Pack scalar u32 words into a vector."""
+    frag = cute.make_rmem_tensor((len(vals),), U32)
+    for k, v in enumerate(vals):
+        frag[k] = v
+    return frag.load()
 
 
 def _push(peers, mc_base, line, words, use_mc):
     """Store one 16 B line at `line` of every peer's inbox."""
     if use_mc:
-        _st_v4_mc(_line_ptr(mc_base, line), *words)
+        # inline PTX: CuTeDSL has no relaxed.sys multimem store
+        cute.arch.inline_ptx(
+            "multimem.st.relaxed.sys.global.v4.f32 [{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}};",
+            read_only_args=[
+                _ptr(_line_addr(mc_base, line), _LINE_BYTES),
+                *(words[k] for k in range(4)),
+            ],
+        )
     else:
         for peer in peers:
-            _st_v4(_line_ptr(peer, line), *words)
+            _store(_line_addr(peer, line), words, sem="relaxed", scope="sys")
 
 
-# ---- element codec: u32 words of 1x fp32 / 2x bf16 / 2x fp16 <-> fp32 -----------
-
-
-def _unpack(w, dt):
-    if dt == _FP32:
-        return [
-            cute.arch.inline_ptx(
-                "mov.b32 {$w0}, {$r0};", write_only_types=[F32], read_only_args=[w]
-            )
-        ]
-    if dt == _BF16:  # bf16 -> f32 is exact: the bf16 bits are the top half of the f32
-        ptx = (
-            "{ .reg .b32 a, b; shl.b32 a, {$r0}, 16; and.b32 b, {$r0}, 0xFFFF0000;"
-            " mov.b32 {$w0}, a; mov.b32 {$w1}, b; }"
-        )
-    else:
-        ptx = (
-            "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, {$r0};"
-            " cvt.f32.f16 {$w0}, lo; cvt.f32.f16 {$w1}, hi; }"
-        )
-    return list(
-        cute.arch.inline_ptx(ptx, write_only_types=[F32, F32], read_only_args=[w])
-    )
-
-
-def _pack(fs, dt):
-    if dt == _FP32:
-        return [
-            cute.arch.inline_ptx(
-                "mov.b32 {$w0}, {$r0};", write_only_types=[U32], read_only_args=[f]
-            )
-            for f in fs
-        ]
-    cvt = "cvt.rn.bf16x2.f32" if dt == _BF16 else "cvt.rn.f16x2.f32"
-    # the second source operand lands in the low half (element 0)
-    return [
-        cute.arch.inline_ptx(
-            f"{cvt} {{$w0}}, {{$r1}}, {{$r0}};",
-            write_only_types=[U32],
-            read_only_args=[fs[k], fs[k + 1]],
-        )
-        for k in range(0, len(fs), 2)
-    ]
-
-
-def _reduce(words, nsrc, dt):
-    """Sum `nsrc` source-major groups of u32 words elementwise in fp32."""
-    per = len(words) // nsrc
-    acc = [f for w in words[:per] for f in _unpack(w, dt)]
-    for s in range(1, nsrc):
-        vals = [f for w in words[s * per : (s + 1) * per] for f in _unpack(w, dt)]
-        acc = [a + v for a, v in zip(acc, vals)]
-    return _pack(acc, dt)
+def _reduce(payloads, dt):
+    """Sum per-source payload vectors elementwise in fp32, rounding once at the end."""
+    elem = _ELEM_TYPE[dt]
+    acc = payloads[0].bitcast(elem).to(F32)
+    for p in payloads[1:]:
+        acc = acc + p.bitcast(elem).to(F32)
+    return acc.to(elem).bitcast(U32)
 
 
 # ---- LL protocol ----------------------------------------------------------------
 
 
-def _ll_ready(f0, f1, eu):
-    return cute.arch.inline_ptx(
-        "{ .reg .pred p; setp.eq.u32 p, {$r0}, {$r2}; setp.eq.and.u32 p, {$r1}, {$r2}, p;"
-        " selp.u32 {$w0}, 1, 0, p; }",
-        write_only_types=[U32],
-        read_only_args=[f0, f1, eu],
-    )
-
-
 @cute.jit
 def _ll_recv(base: I64, line0: I32, stride: I32, eu: U32, nsrc: cutlass.Constexpr[int]):
-    """Payload words of line `line0 + s * stride` for every source s, once published.
+    """Payload (2 words) of line `line0 + s * stride` for every source s, once published.
 
     All loads are issued before the first spin so cross-rank latency overlaps."""
-    ptrs = [_line_ptr(base, line0 + s * stride) for s in range(nsrc)]
-    vals = [_ld_v4(p) for p in ptrs]
-    words = []
+    lines = [_ld_line(base, line0 + s * stride) for s in range(nsrc)]
+    payloads = []
     for s in cutlass.range_constexpr(nsrc):
-        d0, f0, d1, f1 = vals[s]
-        rdy = _ll_ready(f0, f1, eu)
-        while rdy == U32(0):
-            d0, f0, d1, f1 = _ld_v4(ptrs[s])
-            rdy = _ll_ready(f0, f1, eu)
-        words.append(d0)
-        words.append(d1)
-    return words
+        line = lines[s]
+        while line[1] != eu or line[3] != eu:
+            line = _ld_line(base, line0 + s * stride)
+        payloads.append(_words(line[0], line[2]))
+    return payloads
 
 
 # ---- Lamport (negative-zero sentinel) protocol ----------------------------------
@@ -264,52 +206,17 @@ def _sentinel_word(dt) -> int:
     return 0x80000000 if dt == _FP32 else 0x80008000
 
 
-def _scrub(w, dt):
-    """Replace every -0.0 element in a u32 word with +0.0."""
-    if dt == _FP32:
-        ptx = (
-            "{ .reg .b32 t; set.eq.u32.u32 t, {$r0}, 0x80000000; not.b32 t, t;"
-            " and.b32 {$w0}, {$r0}, t; }"
-        )
-    else:
-        ptx = (
-            "{ .reg .b32 m, t, r; mov.b32 r, {$r0};"
-            " and.b32 m, r, 0xFFFF; set.eq.u32.u32 t, m, 0x8000;"
-            " and.b32 t, t, 0xFFFF; not.b32 t, t; and.b32 r, r, t;"
-            " and.b32 m, r, 0xFFFF0000; set.eq.u32.u32 t, m, 0x80000000;"
-            " and.b32 t, t, 0xFFFF0000; not.b32 t, t; and.b32 {$w0}, r, t; }"
-        )
-    return cute.arch.inline_ptx(ptx, write_only_types=[U32], read_only_args=[w])
+def _is_neg_zero(words, dt):
+    """Elementwise: is the element -0.0? Compares bits on a 16- or 32-bit view."""
+    bits_type, neg_zero = _NEG_ZERO_BITS[dt]
+    return words.bitcast(bits_type) == bits_type(neg_zero)
 
 
-def _lamport_ready(w0, w1, w2, w3, dt):
-    if dt == _FP32:
-        checks = "".join(
-            f" set.eq.u32.u32 t, {{$r{k}}}, 0x80000000; or.b32 a, a, t;"
-            for k in range(4)
-        )
-    else:
-        checks = "".join(
-            f" and.b32 m, {{$r{k}}}, 0xFFFF; set.eq.u32.u32 t, m, 0x8000; or.b32 a, a, t;"
-            f" and.b32 m, {{$r{k}}}, 0xFFFF0000; set.eq.u32.u32 t, m, 0x80000000;"
-            f" or.b32 a, a, t;"
-            for k in range(4)
-        )
-    return cute.arch.inline_ptx(
-        "{ .reg .pred p; .reg .b32 a, m, t; mov.b32 a, 0;"
-        + checks
-        + " setp.eq.u32 p, a, 0; selp.u32 {$w0}, 1, 0, p; }",
-        write_only_types=[U32],
-        read_only_args=[w0, w1, w2, w3],
-    )
-
-
-def _st_sentinel(ptr, dt):
-    cute.arch.inline_ptx(
-        f"{{ .reg .b32 s; mov.b32 s, {_sentinel_word(dt):#x};"
-        " st.global.v4.u32 [{$r0}], {s, s, s, s}; }",
-        read_only_args=[ptr],
-    )
+def _scrub(words, dt):
+    """Replace every -0.0 element with +0.0."""
+    bits_type, _ = _NEG_ZERO_BITS[dt]
+    bits = cute.where(_is_neg_zero(words, dt), bits_type(0), words.bitcast(bits_type))
+    return bits.bitcast(U32)
 
 
 @cute.jit
@@ -320,18 +227,15 @@ def _lamport_recv(
     nsrc: cutlass.Constexpr[int],
     dt: cutlass.Constexpr[int],
 ):
-    """Words of line `line0 + s * stride` for every source s, once no element is -0.0."""
-    ptrs = [_line_ptr(base, line0 + s * stride) for s in range(nsrc)]
-    vals = [_ld_v4(p) for p in ptrs]
-    words = []
+    """Line `line0 + s * stride` for every source s, once no element is -0.0."""
+    lines = [_ld_line(base, line0 + s * stride) for s in range(nsrc)]
+    out = []
     for s in cutlass.range_constexpr(nsrc):
-        w0, w1, w2, w3 = vals[s]
-        rdy = _lamport_ready(w0, w1, w2, w3, dt)
-        while rdy == U32(0):
-            w0, w1, w2, w3 = _ld_v4(ptrs[s])
-            rdy = _lamport_ready(w0, w1, w2, w3, dt)
-        words += [w0, w1, w2, w3]
-    return words
+        line = lines[s]
+        while cute.any_(_is_neg_zero(line, dt)):
+            line = _ld_line(base, line0 + s * stride)
+        out.append(line)
+    return out
 
 
 @cute.jit
@@ -345,10 +249,11 @@ def _lamport_clear(
     nregions: cutlass.Constexpr[int],
     dt: cutlass.Constexpr[int],
 ):
+    sentinel = cute.full((4,), _sentinel_word(dt), U32)
     for r in cutlass.range_constexpr(nregions):
         j = tid
         while j < used:
-            _st_sentinel(_line_ptr(my_base, line0 + r * stride + j), dt)
+            _store(_line_addr(my_base, line0 + r * stride + j), sentinel)
             j = j + nthreads
 
 
@@ -412,13 +317,17 @@ def _ll_one_shot_kernel(
     peers = [peer_arr[s] for s in range(ws)]
     i = tid
     while i < lines:
-        d0, d1 = _ld_nc_v2(_ptr(x_base + I64(i) * 8))
-        _push(peers, mc_base, slot + rank * stride + i, [d0, eu, d1, eu], use_mc)
+        d = _ld_input(x_base + I64(i) * 8, 2)
+        _push(
+            peers, mc_base, slot + rank * stride + i, _words(d[0], eu, d[1], eu), use_mc
+        )
         i = i + nthreads
     i = tid
     while i < lines:
-        r0, r1 = _reduce(_ll_recv(my_base, slot + i, stride, eu, ws), ws, dt)
-        _st_out_v2(_ptr(out_base + I64(i) * 8), r0, r1)
+        _store(
+            out_base + I64(i) * 8,
+            _reduce(_ll_recv(my_base, slot + i, stride, eu, ws), dt),
+        )
         i = i + nthreads
     _finish(state, tidx, gdim, epoch + I32(1), I32(0), I32(0), False)
 
@@ -448,27 +357,33 @@ def _ll_two_shot_kernel(
     # reduce-scatter push: chunk d -> region `rank` of peer d (zero-padded tail)
     i = tid
     while i < chunk:
-        for d in cutlass.range_constexpr(ws):
-            g = d * chunk + i
-            d0 = U32(0)
-            d1 = U32(0)
+        for dst in cutlass.range_constexpr(ws):
+            g = dst * chunk + i
+            d = cute.full((2,), 0, U32)
             if g < lines:
-                d0, d1 = _ld_nc_v2(_ptr(x_base + I64(g) * 8))
-            _st_v4(_line_ptr(peers[d], rs + rank * stride + i), d0, eu, d1, eu)
+                d = _ld_input(x_base + I64(g) * 8, 2)
+            _store(
+                _line_addr(peers[dst], rs + rank * stride + i),
+                _words(d[0], eu, d[1], eu),
+                sem="relaxed",
+                scope="sys",
+            )
         i = i + nthreads
     # reduce own chunk, all-gather push
     i = tid
     while i < chunk:
-        r0, r1 = _reduce(_ll_recv(my_base, rs + i, stride, eu, ws), ws, dt)
-        _push(peers, mc_base, ag + rank * stride + i, [r0, eu, r1, eu], use_mc)
+        r = _reduce(_ll_recv(my_base, rs + i, stride, eu, ws), dt)
+        _push(
+            peers, mc_base, ag + rank * stride + i, _words(r[0], eu, r[1], eu), use_mc
+        )
         i = i + nthreads
     i = tid
     while i < chunk:
-        words = _ll_recv(my_base, ag + i, stride, eu, ws)
+        payloads = _ll_recv(my_base, ag + i, stride, eu, ws)
         for j in cutlass.range_constexpr(ws):
             g = j * chunk + i
             if g < lines:
-                _st_out_v2(_ptr(out_base + I64(g) * 8), words[2 * j], words[2 * j + 1])
+                _store(out_base + I64(g) * 8, payloads[j])
         i = i + nthreads
     _finish(state, tidx, gdim, epoch + I32(1), I32(0), I32(0), False)
 
@@ -496,15 +411,17 @@ def _lamport_one_shot_kernel(
     peers = [peer_arr[s] for s in range(ws)]
     i = tid
     while i < lines:
-        w = [_scrub(v, dt) for v in _ld_nc_v4(_ptr(x_base + I64(i) * 16))]
+        w = _scrub(_ld_input(x_base + I64(i) * 16, 4), dt)
         _push(peers, mc_base, slot + rank * stride + i, w, use_mc)
         i = i + nthreads
     # restore the slot used by the previous call while peer data is in flight
     _lamport_clear(my_base, stale * ws * stride, stride, used, tid, nthreads, ws, dt)
     i = tid
     while i < lines:
-        r = _reduce(_lamport_recv(my_base, slot + i, stride, ws, dt), ws, dt)
-        _st_out_v4(_ptr(out_base + I64(i) * 16), *r)
+        _store(
+            out_base + I64(i) * 16,
+            _reduce(_lamport_recv(my_base, slot + i, stride, ws, dt), dt),
+        )
         i = i + nthreads
     _finish(state, tidx, gdim, (step + I32(1)) % I32(3), step, lines, True)
 
@@ -534,34 +451,33 @@ def _lamport_two_shot_kernel(
     peers = [peer_arr[s] for s in range(ws)]
     i = tid
     while i < chunk:
-        for d in cutlass.range_constexpr(ws):
-            g = d * chunk + i
-            w0 = U32(0)
-            w1 = U32(0)
-            w2 = U32(0)
-            w3 = U32(0)
+        for dst in cutlass.range_constexpr(ws):
+            g = dst * chunk + i
+            w = cute.full((4,), 0, U32)
             if g < lines:
-                w0, w1, w2, w3 = _ld_nc_v4(_ptr(x_base + I64(g) * 16))
-            w = [_scrub(v, dt) for v in (w0, w1, w2, w3)]
-            _st_v4(_line_ptr(peers[d], rs + rank * stride + i), *w)
+                w = _ld_input(x_base + I64(g) * 16, 4)
+            _store(
+                _line_addr(peers[dst], rs + rank * stride + i),
+                _scrub(w, dt),
+                sem="relaxed",
+                scope="sys",
+            )
         i = i + nthreads
     _lamport_clear(
         my_base, stale * 2 * ws * stride, stride, used, tid, nthreads, 2 * ws, dt
     )
     i = tid
     while i < chunk:
-        r = _reduce(_lamport_recv(my_base, rs + i, stride, ws, dt), ws, dt)
-        _push(
-            peers, mc_base, ag + rank * stride + i, [_scrub(v, dt) for v in r], use_mc
-        )
+        r = _reduce(_lamport_recv(my_base, rs + i, stride, ws, dt), dt)
+        _push(peers, mc_base, ag + rank * stride + i, _scrub(r, dt), use_mc)
         i = i + nthreads
     i = tid
     while i < chunk:
-        words = _lamport_recv(my_base, ag + i, stride, ws, dt)
+        lines_in = _lamport_recv(my_base, ag + i, stride, ws, dt)
         for j in cutlass.range_constexpr(ws):
             g = j * chunk + i
             if g < lines:
-                _st_out_v4(_ptr(out_base + I64(g) * 16), *words[4 * j : 4 * j + 4])
+                _store(out_base + I64(g) * 16, lines_in[j])
         i = i + nthreads
     _finish(state, tidx, gdim, (step + I32(1)) % I32(3), step, chunk, True)
 
