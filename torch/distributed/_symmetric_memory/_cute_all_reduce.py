@@ -1,7 +1,9 @@
 """Barrier-free one-shot / two-shot all-reduce kernels in CuTeDSL over symmetric memory.
 
-Works on any symmetric-memory backend that exposes peer and multicast pointers
-(``CUDA`` and ``NCCL``). See Note [Barrier-free all-reduce protocols] for the design.
+The inbox comes from PyTorch symmetric memory (``allocator="symm_mem"``, either the
+``CUDA`` or ``NCCL`` backend) or from an nccl4py-backed Python-allocator ``MemPool``
+registered as an NCCL symmetric window (``allocator="nccl4py"``). See Note
+[Barrier-free all-reduce protocols] for the design.
 """
 
 from __future__ import annotations
@@ -17,7 +19,12 @@ from cutlass.cute.runtime import make_ptr
 
 import torch
 import torch.distributed as dist
-from torch.distributed._symmetric_memory import _resolve_group_name, empty, rendezvous
+from torch.distributed._symmetric_memory import (
+    _nccl4py_pool,
+    _resolve_group_name,
+    empty,
+    rendezvous,
+)
 from torch.distributed.distributed_c10d import _resolve_process_group, ProcessGroup
 
 
@@ -518,15 +525,23 @@ def _launch(
 
 
 class _Workspace:
-    """Per (group, device, protocol, algo, dtype) inbox + device-side epoch state.
+    """Per (group, device, protocol, algo, dtype, allocator) inbox + device-side epoch
+    state.
 
     The inbox only grows; growing it is collective and must happen outside CUDA graph
     capture (warm up eagerly at the largest size first)."""
 
     def __init__(
-        self, group_name: str, device: torch.device, protocol: str, algo: str, dt: int
+        self,
+        group_name: str,
+        device: torch.device,
+        protocol: str,
+        algo: str,
+        dt: int,
+        allocator: str,
     ) -> None:
         self.group_name = group_name
+        self.allocator = allocator
         self.pg = _resolve_process_group(group_name)
         self.device = device
         self.protocol = protocol
@@ -554,13 +569,16 @@ class _Workspace:
                 "during CUDA graph capture; run the largest size once eagerly first."
             )
         capacity = 1 << max(10, math.ceil(math.log2(region_lines)))
-        if self.buf is not None:
-            # peers may still be pushing into the old inbox
-            self._sync()
-            self.buf = self.hdl = None
+        self.release()
         nbytes = self.nslots * self.nregions * capacity * _LINE_BYTES
-        buf = empty(nbytes, dtype=torch.uint8, device=self.device)
-        hdl = rendezvous(buf, self.group_name)
+        if self.allocator == "nccl4py":
+            buf = _nccl4py_pool.empty(nbytes, dtype=torch.uint8, device=self.device)
+            hdl = _nccl4py_pool.NcclWindow(buf, self.pg)
+            peers_dev = hdl.buffer_ptrs_dev.data_ptr()
+        else:
+            buf = empty(nbytes, dtype=torch.uint8, device=self.device)
+            hdl = rendezvous(buf, self.group_name)
+            peers_dev = hdl.buffer_ptrs_dev
         if self.protocol == "ll":
             buf.zero_()
             self.state.zero_()[0] = 1  # epoch 0 would match the zeroed flags
@@ -571,10 +589,21 @@ class _Workspace:
         # every peer's inbox must be initialized before anyone pushes into it
         self._sync()
         self.buf, self.hdl, self.capacity = buf, hdl, capacity
-        self.peers_ptr = make_ptr(I64, hdl.buffer_ptrs_dev, _GMEM)
+        self.peers_ptr = make_ptr(I64, peers_dev, _GMEM)
         self.my_base = buf.data_ptr()
         self.mc_base = hdl.multicast_ptr
         self.state_ptr = make_ptr(I32, self.state.data_ptr(), _GMEM)
+
+    def release(self) -> None:
+        """Free the inbox. Collective, like growing it."""
+        if self.buf is None:
+            return
+        # peers may still be pushing into the inbox
+        self._sync()
+        if isinstance(self.hdl, _nccl4py_pool.NcclWindow):
+            self.hdl.close()
+        self.buf = self.hdl = None
+        self.capacity = 0
 
 
 _workspaces: dict[tuple[object, ...], _Workspace] = {}
@@ -582,9 +611,12 @@ _compiled: dict[tuple[int, int, int, bool], object] = {}
 
 
 def _release_workspaces() -> None:
-    """Free all inboxes. Call before destroying the process group: the NCCL backend
-    cannot deregister a window once its communicator is gone."""
+    """Free all inboxes. Collective. Call before destroying the process group: NCCL
+    windows cannot be deregistered once their communicator is gone."""
+    for ws_obj in _workspaces.values():
+        ws_obj.release()
     _workspaces.clear()
+    _nccl4py_pool.release_pool()
 
 
 def _all_reduce(
@@ -594,9 +626,12 @@ def _all_reduce(
     protocol: Literal["ll", "lamport"],
     use_multimem: bool,
     out: torch.Tensor | None,
+    allocator: Literal["symm_mem", "nccl4py"],
 ) -> torch.Tensor:
     if (protocol, algo) not in _KERNEL_KIND:
         raise ValueError(f"unknown protocol {protocol!r}")
+    if allocator not in ("symm_mem", "nccl4py"):
+        raise ValueError(f"unknown allocator {allocator!r}")
     if x.dtype not in _DTYPE_CODE:
         raise ValueError(f"unsupported dtype {x.dtype}; expected fp32, bf16 or fp16")
     x = x.contiguous()
@@ -616,10 +651,12 @@ def _all_reduce(
 
     dt = _DTYPE_CODE[x.dtype]
     group_name = _resolve_group_name(group)
-    key = (group_name, x.device, protocol, algo, dt)
+    key = (group_name, x.device, protocol, algo, dt, allocator)
     ws_obj = _workspaces.get(key)
     if ws_obj is None:
-        ws_obj = _workspaces[key] = _Workspace(group_name, x.device, protocol, algo, dt)
+        ws_obj = _workspaces[key] = _Workspace(
+            group_name, x.device, protocol, algo, dt, allocator
+        )
     world = ws_obj.world_size
     lines = nbytes // payload
     chunk = -(-lines // world)
@@ -628,7 +665,7 @@ def _all_reduce(
     if use_multimem and not ws_obj.mc_base:
         raise RuntimeError(
             "use_multimem=True but the symmetric inbox has no multicast address "
-            "(no NVLS support, or NCCL backend with NCCL_NVLS_ENABLE=0)"
+            "(no NVLS support, or an NCCL-allocated inbox with NCCL_NVLS_ENABLE=0)"
         )
 
     kind = _KERNEL_KIND[(protocol, algo)]
@@ -665,6 +702,7 @@ def one_shot_all_reduce(
     protocol: Literal["ll", "lamport"] = "ll",
     use_multimem: bool = False,
     out: torch.Tensor | None = None,
+    allocator: Literal["symm_mem", "nccl4py"] = "symm_mem",
 ) -> torch.Tensor:
     r"""Sum-all-reduce ``x`` across ``group`` with a single barrier-free hop.
 
@@ -672,10 +710,13 @@ def one_shot_all_reduce(
     ``x`` and ``out`` are regular tensors (``out=x`` is allowed). Latency-optimal for
     small messages. ``protocol`` selects the arrival signal (``"ll"``: epoch flags,
     ``"lamport"``: negative-zero sentinel); ``use_multimem`` broadcasts the push with
-    one ``multimem.st``. Collective: all ranks must call it with the same arguments,
-    in the same order. See Note [Barrier-free all-reduce protocols].
+    one ``multimem.st``. ``allocator`` picks where the inbox lives: PyTorch symmetric
+    memory (``"symm_mem"``) or an nccl4py-backed ``MemPool`` registered as an NCCL
+    symmetric window on ``group``'s communicator (``"nccl4py"``). Collective: all ranks
+    must call it with the same arguments, in the same order. See Note
+    [Barrier-free all-reduce protocols].
     """
-    return _all_reduce(x, group, "one_shot", protocol, use_multimem, out)
+    return _all_reduce(x, group, "one_shot", protocol, use_multimem, out, allocator)
 
 
 def two_shot_all_reduce(
@@ -685,10 +726,11 @@ def two_shot_all_reduce(
     protocol: Literal["ll", "lamport"] = "ll",
     use_multimem: bool = False,
     out: torch.Tensor | None = None,
+    allocator: Literal["symm_mem", "nccl4py"] = "symm_mem",
 ) -> torch.Tensor:
     r"""Sum-all-reduce ``x`` across ``group`` as a barrier-free reduce-scatter then
     all-gather. Moves ``1 / world_size`` of the one-shot traffic per hop at the cost of
     a second hop. Same arguments and contract as :func:`one_shot_all_reduce`;
     ``use_multimem`` applies to the all-gather push.
     """
-    return _all_reduce(x, group, "two_shot", protocol, use_multimem, out)
+    return _all_reduce(x, group, "two_shot", protocol, use_multimem, out, allocator)

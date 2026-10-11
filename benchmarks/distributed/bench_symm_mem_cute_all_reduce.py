@@ -7,7 +7,8 @@ Usage:
 torchrun --nproc-per-node 8 benchmarks/distributed/bench_symm_mem_cute_all_reduce.py \
     --backend CUDA --dtype bfloat16 --min-bytes 1024 --max-bytes 16777216
 
-For the NCCL backend's multicast variants, also set NCCL_NVLS_ENABLE=1.
+Add --allocator nccl4py to put the inbox in an nccl4py-backed MemPool. For multicast
+variants on NCCL-allocated inboxes, also set NCCL_NVLS_ENABLE=1.
 """
 
 import argparse
@@ -17,6 +18,7 @@ import os
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+from torch.distributed._symmetric_memory import _nccl4py_pool
 from torch.distributed._symmetric_memory._cute_all_reduce import (
     _release_workspaces,
     one_shot_all_reduce,
@@ -50,6 +52,9 @@ def time_graph(fn, ops_per_graph: int, replays: int) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", default="CUDA", choices=["CUDA", "NCCL"])
+    parser.add_argument(
+        "--allocator", default="symm_mem", choices=["symm_mem", "nccl4py"]
+    )
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--min-bytes", type=int, default=1024)
     parser.add_argument("--max-bytes", type=int, default=16 << 20)
@@ -69,6 +74,12 @@ def main() -> None:
     has_mc = (
         symm_mem.rendezvous(symm_mem.empty(16, device=device), group).multicast_ptr != 0
     )
+    if args.allocator == "nccl4py":
+        window = _nccl4py_pool.NcclWindow(
+            _nccl4py_pool.empty(16, device=device), dist.group.WORLD
+        )
+        has_mc = window.multicast_ptr != 0
+        window.close()
 
     sizes = []
     nbytes = args.min_bytes
@@ -87,7 +98,11 @@ def main() -> None:
             for mc in (False, True) if has_mc else (False,):
                 name = f"cute_{proto}_{algo}" + ("_mc" if mc else "")
                 cute_ops[name] = functools.partial(
-                    fn, group=group, protocol=proto, use_multimem=mc
+                    fn,
+                    group=group,
+                    protocol=proto,
+                    use_multimem=mc,
+                    allocator=args.allocator,
                 )
     torch_ops = {
         "torch_one_shot": lambda t: torch.ops.symm_mem.one_shot_all_reduce(
@@ -139,6 +154,7 @@ def main() -> None:
     if rank == 0:
         print(
             f"\nall_reduce us/op (CUDA graph), backend={args.backend}, "
+            f"allocator={args.allocator}, "
             f"world_size={world_size}, dtype={args.dtype}, multicast={has_mc}"
         )
         width = max(len(n) for n in results) + 2

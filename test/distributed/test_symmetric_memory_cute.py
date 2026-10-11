@@ -17,6 +17,9 @@ from torch.testing._internal.common_utils import requires_cuda_p2p_access, run_t
 
 HAS_CUTE = importlib.util.find_spec("cutlass") is not None
 if HAS_CUTE:
+    from cuda.bindings import runtime as cudart
+
+    from torch.distributed._symmetric_memory import _nccl4py_pool
     from torch.distributed._symmetric_memory._cute_all_reduce import (
         _release_workspaces,
         one_shot_all_reduce,
@@ -30,9 +33,10 @@ DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
 class _CuteAllReduceTests:
-    """Shared tests; subclasses pick the symmetric-memory backend."""
+    """Shared tests; subclasses pick the symmetric-memory backend and inbox allocator."""
 
-    BACKEND = ""
+    BACKEND = "CUDA"
+    ALLOCATOR = "symm_mem"
 
     @classmethod
     def _init_pg(cls, rank, world_size, rdvz_file):
@@ -55,8 +59,14 @@ class _CuteAllReduceTests:
         return torch.device("cuda", self.rank)
 
     def _multimem_options(self) -> tuple[bool, ...]:
-        probe = symm_mem.empty(16, device=self.device)
-        has_mc = symm_mem.rendezvous(probe, self.pg.group_name).multicast_ptr != 0
+        if self.ALLOCATOR == "nccl4py":
+            probe = _nccl4py_pool.empty(16, device=self.device)
+            window = _nccl4py_pool.NcclWindow(probe, self.pg)
+            has_mc = window.multicast_ptr != 0
+            window.close()
+        else:
+            probe = symm_mem.empty(16, device=self.device)
+            has_mc = symm_mem.rendezvous(probe, self.pg.group_name).multicast_ptr != 0
         return (False, True) if has_mc else (False,)
 
     def _rank_inputs(self, numel: int, dtype: torch.dtype, seed: int):
@@ -87,7 +97,11 @@ class _CuteAllReduceTests:
                         ):
                             xs = self._rank_inputs(numel, dtype, seed)
                             out = fn(
-                                xs[self.rank], group, protocol=proto, use_multimem=mc
+                                xs[self.rank],
+                                group,
+                                protocol=proto,
+                                allocator=self.ALLOCATOR,
+                                use_multimem=mc,
                             )
                             self.assertEqual(
                                 out,
@@ -105,7 +119,7 @@ class _CuteAllReduceTests:
             for fn in ALGOS.values():
                 xs = self._rank_inputs(4096, torch.bfloat16, 0)
                 x = xs[self.rank].clone()
-                out = fn(x, group, protocol=proto, out=x)
+                out = fn(x, group, protocol=proto, allocator=self.ALLOCATOR, out=x)
                 self.assertEqual(out.data_ptr(), x.data_ptr())
                 self.assertEqual(x, self._expected(xs, torch.bfloat16), atol=0, rtol=0)
         _release_workspaces()
@@ -126,6 +140,7 @@ class _CuteAllReduceTests:
                         ),
                         group,
                         protocol=proto,
+                        allocator=self.ALLOCATOR,
                         use_multimem=mc,
                     )
         schedule = random.Random(0)
@@ -140,7 +155,9 @@ class _CuteAllReduceTests:
             x = (base * (self.rank + 1) + it % 5).to(torch.bfloat16)
             if skew.random() < 0.5:
                 torch.cuda._sleep(skew.randint(0, 1_000_000))
-            out = ALGOS[algo](x, group, protocol=proto, use_multimem=mc)
+            out = ALGOS[algo](
+                x, group, protocol=proto, allocator=self.ALLOCATOR, use_multimem=mc
+            )
             ws = self.world_size
             expected = (base * (ws * (ws + 1) // 2) + ws * (it % 5)).to(torch.bfloat16)
             results.append((it, proto, algo, mc, out, expected))
@@ -159,13 +176,15 @@ class _CuteAllReduceTests:
             for fn in ALGOS.values():
                 x = torch.full((numel,), self.rank + 1.0, device=self.device)
                 out = torch.empty_like(x)
-                fn(x, group, protocol=proto, out=out)  # grow the inbox eagerly
+                fn(
+                    x, group, protocol=proto, allocator=self.ALLOCATOR, out=out
+                )  # grow the inbox eagerly
                 stream = torch.cuda.Stream()
                 stream.wait_stream(torch.cuda.current_stream())
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
                     for _ in range(4):
-                        fn(x, group, protocol=proto, out=out)
+                        fn(x, group, protocol=proto, allocator=self.ALLOCATOR, out=out)
                 for _ in range(5):
                     out.zero_()
                     graph.replay()
@@ -178,7 +197,9 @@ class _CuteAllReduceTests:
         x = torch.ones(3, device=self.device, dtype=torch.bfloat16)
         for proto in PROTOCOLS:
             with self.assertRaisesRegex(ValueError, "multiple of"):
-                one_shot_all_reduce(x, self.pg.group_name, protocol=proto)
+                one_shot_all_reduce(
+                    x, self.pg.group_name, protocol=proto, allocator=self.ALLOCATOR
+                )
 
 
 @skipUnless(HAS_CUTE, "requires CuTeDSL (nvidia-cutlass-dsl)")
@@ -192,6 +213,41 @@ class CuteAllReduceCUDABackendTest(_CuteAllReduceTests, MultiProcContinuousTest)
 @requires_cuda_p2p_access()
 class CuteAllReduceNCCLBackendTest(_CuteAllReduceTests, MultiProcContinuousTest):
     BACKEND = "NCCL"
+
+
+@skipUnless(HAS_CUTE, "requires CuTeDSL (nvidia-cutlass-dsl)")
+@requires_nccl_version((2, 28), "NCCL symmetric windows need 2.28+")
+@requires_cuda_p2p_access()
+class CuteAllReduceNccl4pyAllocatorTest(_CuteAllReduceTests, MultiProcContinuousTest):
+    ALLOCATOR = "nccl4py"
+
+    @skip_if_lt_x_gpu(2)
+    def test_window_peer_pointers(self) -> None:
+        t = _nccl4py_pool.empty(1024, dtype=torch.int32, device=self.device)
+        window = _nccl4py_pool.NcclWindow(t, self.pg)
+        self.assertEqual(len(window.buffer_ptrs), self.world_size)
+        t.fill_(self.rank + 1)
+        torch.cuda.synchronize()
+        dist.barrier()
+        for peer, ptr in enumerate(window.buffer_ptrs):
+            got = torch.empty_like(t)
+            (err,) = cudart.cudaMemcpy(
+                got.data_ptr(),
+                ptr,
+                t.nbytes,
+                cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+            )
+            self.assertEqual(err, cudart.cudaError_t.cudaSuccess)
+            self.assertTrue(bool((got == peer + 1).all()), f"peer {peer}")
+        dist.barrier()
+        window.close()
+        del t
+        _nccl4py_pool.release_pool()
+
+    @skip_if_lt_x_gpu(2)
+    def test_window_rejects_foreign_tensor(self) -> None:
+        with self.assertRaisesRegex(ValueError, "_nccl4py_pool.empty"):
+            _nccl4py_pool.NcclWindow(torch.empty(16, device=self.device), self.pg)
 
 
 if __name__ == "__main__":
