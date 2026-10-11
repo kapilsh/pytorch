@@ -3,8 +3,10 @@
 Segments come from ``ncclMemAlloc`` through :meth:`torch.cuda.MemPool.from_py_allocator`.
 :class:`NcclWindow` registers a tensor from that pool as an NCCL ``COLL_SYMMETRIC``
 window on a process group's own communicator, and exposes the peer and multicast
-pointers device kernels need. This path does not go through the C++ symmetric-memory
-allocator or ``rendezvous``.
+pointers device kernels need. Because the window lives on the group's communicator,
+NCCL collectives issued through the process group on that tensor (for example
+``dist.all_reduce``) also run NCCL's symmetric kernels. This path does not go through
+the C++ symmetric-memory allocator or ``rendezvous``.
 """
 
 from __future__ import annotations

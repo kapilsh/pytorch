@@ -245,6 +245,27 @@ class CuteAllReduceNccl4pyAllocatorTest(_CuteAllReduceTests, MultiProcContinuous
         _nccl4py_pool.release_pool()
 
     @skip_if_lt_x_gpu(2)
+    def test_nccl_symmetric_kernel(self) -> None:
+        t = _nccl4py_pool.empty(1 << 16, dtype=torch.bfloat16, device=self.device)
+        t.fill_(self.rank + 1)
+        window = _nccl4py_pool.NcclWindow(t, self.pg)
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            dist.all_reduce(t, group=self.pg)
+            torch.cuda.synchronize()
+        ws = self.world_size
+        self.assertTrue(bool((t == ws * (ws + 1) / 2).all()))
+        kernels = {e.name for e in prof.events() if "nccl" in e.name.lower()}
+        self.assertTrue(
+            any(k.startswith("ncclSymkDevKernel") for k in kernels), str(kernels)
+        )
+        dist.barrier()
+        window.close()
+        del t
+        _nccl4py_pool.release_pool()
+
+    @skip_if_lt_x_gpu(2)
     def test_window_rejects_foreign_tensor(self) -> None:
         with self.assertRaisesRegex(ValueError, "_nccl4py_pool.empty"):
             _nccl4py_pool.NcclWindow(torch.empty(16, device=self.device), self.pg)
