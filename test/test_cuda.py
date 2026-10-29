@@ -470,6 +470,33 @@ class TestCuda(TestCase):
                 "pinned_use_cuda_host_register:False"
             )
 
+    @unittest.skipIf(not IS_LINUX, "pinned_unmovable is only supported on Linux")
+    def test_pinned_memory_unmovable(self):
+        def vm_pinned_bytes():
+            with open("/proc/self/status") as f:
+                line = next(line for line in f if line.startswith("VmPin:"))
+            return int(line.split()[1]) << 10
+
+        size = 1 << 24
+        torch._C._host_emptyCache()
+        before = vm_pinned_bytes()
+        try:
+            torch.cuda.memory._set_allocator_settings("pinned_unmovable:True")
+            try:
+                pinned_t = torch.ones(size, dtype=torch.uint8).pin_memory()
+            except RuntimeError as e:
+                if "io_uring_setup failed" in str(e):
+                    self.skipTest(str(e))
+                raise
+            self.assertTrue(pinned_t.is_pinned())
+            self.assertGreaterEqual(vm_pinned_bytes() - before, size)
+            self.assertEqual(pinned_t.cuda().cpu(), pinned_t)
+            del pinned_t
+            torch._C._host_emptyCache()
+            self.assertEqual(vm_pinned_bytes(), before)
+        finally:
+            torch.cuda.memory._set_allocator_settings("pinned_unmovable:False")
+
     def test_pinned_memory_with_cudaregister_multithread(self):
         num_threads = 4
         threads = [

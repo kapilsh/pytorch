@@ -7,12 +7,93 @@
 #include <c10/util/Gauge.h>
 
 #include <cuda_runtime_api.h>
+#include <array>
 #include <future>
+
+#ifdef __linux__
+#include <c10/util/error.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+// Older kernel headers (e.g. manylinux) predate io_uring; the numbers are the
+// same on every architecture.
+#ifndef __NR_io_uring_setup
+#define __NR_io_uring_setup 425
+#endif
+#ifndef __NR_io_uring_register
+#define __NR_io_uring_register 427
+#endif
+#endif
 
 namespace at::cuda {
 namespace {
 
 using Block = HostBlock<CUDAStream>;
+
+#ifdef __linux__
+// pinned_unmovable: pages that are only cudaHostRegister'd (or mlocked) can
+// still be migrated by the kernel, e.g. by compaction when a NUMA node runs
+// low on free memory, and a GPU copy that touches a page under migration
+// stalls for up to hundreds of milliseconds. A long-term pin
+// (pin_user_pages(FOLL_LONGTERM), the pin taken by an RDMA memory
+// registration) makes compaction, reclaim and NUMA balancing skip the pages.
+// io_uring buffer registration takes that pin without needing an RDMA device;
+// the ring is never used for I/O. Like an RDMA registration, it is charged to
+// RLIMIT_MEMLOCK unless the process has CAP_IPC_LOCK.
+//
+// The memory must be a shared mapping: on fork, the kernel copies long-term
+// pinned pages of a private mapping into the child instead of sharing them.
+
+// io_uring_register limits each registered buffer to 1 GiB.
+constexpr size_t kMaxIoUringBufferSize = size_t(1) << 30;
+constexpr unsigned kIoUringRegisterBuffers = 0;
+constexpr unsigned kIoUringUnregisterBuffers = 1;
+
+// Long-term pins [ptr, ptr + size). Returns an io_uring fd that holds the pin.
+int longTermPin(void* ptr, size_t size) {
+  // struct io_uring_params is 120 bytes; all zeros asks for the defaults.
+  alignas(8) std::array<char, 120> params{};
+  int fd = static_cast<int>(syscall(__NR_io_uring_setup, 1, params.data()));
+  TORCH_CHECK(
+      fd >= 0,
+      "pinned_unmovable: io_uring_setup failed: ",
+      c10::utils::str_error(errno),
+      ". io_uring may be disabled (sysctl kernel.io_uring_disabled) or "
+      "blocked by a seccomp profile.");
+  std::vector<iovec> iovs;
+  for (size_t off = 0; off < size; off += kMaxIoUringBufferSize) {
+    iovs.push_back(
+        {static_cast<char*>(ptr) + off,
+         std::min(kMaxIoUringBufferSize, size - off)});
+  }
+  if (syscall(
+          __NR_io_uring_register,
+          fd,
+          kIoUringRegisterBuffers,
+          iovs.data(),
+          iovs.size()) != 0) {
+    int err = errno;
+    close(fd);
+    TORCH_CHECK(
+        false,
+        "pinned_unmovable: pinning ",
+        size,
+        " bytes failed: ",
+        c10::utils::str_error(err),
+        err == ENOMEM ? " (check RLIMIT_MEMLOCK)" : "");
+  }
+  return fd;
+}
+
+void longTermUnpin(int fd) {
+  // Unregister before closing: a forked child holding a copy of the fd would
+  // otherwise keep the pages pinned until it exits.
+  syscall(__NR_io_uring_register, fd, kIoUringUnregisterBuffers, nullptr, 0);
+  close(fd);
+}
+#endif
 
 struct CUDACachingHostAllocatorImpl
     : public CachingHostAllocatorImpl<CUDAStream, CUDAEventPool::Event> {
@@ -37,6 +118,8 @@ struct CUDACachingHostAllocatorImpl
 
  private:
   ska::flat_hash_map<void*, bool> use_host_register;
+  // pinned_unmovable allocations: ptr -> (size, fd holding the long-term pin).
+  ska::flat_hash_map<void*, std::pair<size_t, int>> unmovable_pins;
 
   void allocate_host_memory(size_t size, void** ptr) override {
     // try allocating from reserve segment first before calling into expensive APIs
@@ -67,9 +150,10 @@ struct CUDACachingHostAllocatorImpl
     }
 
     auto start = std::chrono::steady_clock::now();
-    bool use_register = c10::cuda::CUDACachingAllocator::CUDAAllocatorConfig::pinned_use_cuda_host_register();
+    bool unmovable = c10::cuda::CUDACachingAllocator::CUDAAllocatorConfig::pinned_unmovable();
+    bool use_register = unmovable || c10::cuda::CUDACachingAllocator::CUDAAllocatorConfig::pinned_use_cuda_host_register();
     if (use_register) {
-      allocWithCudaHostRegister(ptr, size);
+      allocWithCudaHostRegister(ptr, size, unmovable);
     } else {
       // Use cudaHostAlloc for allocating pinned memory (global lock in driver)
       if (current_stream_is_capturing_fast_path()) {
@@ -111,12 +195,24 @@ struct CUDACachingHostAllocatorImpl
     // cudaHostUnregister and similarly for cudaHostAlloc / cudaFreeHost.
     void* ptr = block->ptr_;
     bool use_register = false;
+    std::optional<std::pair<size_t, int>> unmovable_pin;
     {
       std::lock_guard<std::mutex> g(stats_.timing_mutex_);
       TORCH_INTERNAL_ASSERT_DEBUG_ONLY(use_host_register.count(ptr) == 1);
       use_register = use_host_register[ptr];
+      auto it = unmovable_pins.find(ptr);
+      if (it != unmovable_pins.end()) {
+        unmovable_pin = it->second;
+        unmovable_pins.erase(it);
+      }
     }
-    if (use_register) {
+    if (unmovable_pin) {
+#ifdef __linux__
+      AT_CUDA_CHECK(cudaHostUnregister(ptr));
+      longTermUnpin(unmovable_pin->second);
+      munmap(ptr, unmovable_pin->first);
+#endif
+    } else if (use_register) {
       AT_CUDA_CHECK(cudaHostUnregister(ptr));
       // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
       std::free(ptr);
@@ -194,12 +290,33 @@ struct CUDACachingHostAllocatorImpl
     }
   }
 
-  void allocWithCudaHostRegister(void** ptr, size_t roundSize) {
+  void allocWithCudaHostRegister(void** ptr, size_t roundSize, bool unmovable) {
     // Here we do regular allocation, pre-fault/map the pages, and then do
     // cudaHostRegister with GPU mapping flags to lock the pages, so we
     // can minimize the cost for the cuda global lock.
-    // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
-    *ptr = std::malloc(roundSize);
+    if (unmovable) {
+#ifdef __linux__
+      // A shared mapping, so that forks do not copy the long-term pinned pages.
+      *ptr = mmap(
+          nullptr,
+          roundSize,
+          PROT_READ | PROT_WRITE,
+          MAP_SHARED | MAP_ANONYMOUS,
+          -1,
+          0);
+      TORCH_CHECK(
+          *ptr != MAP_FAILED,
+          "pinned_unmovable: mmap of ",
+          roundSize,
+          " bytes failed: ",
+          c10::utils::str_error(errno));
+#else
+      TORCH_CHECK(false, "pinned_unmovable is only supported on Linux");
+#endif
+    } else {
+      // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
+      *ptr = std::malloc(roundSize);
+    }
 
     // Parallelize the mapping/registering of pages to reduce wall time
     size_t pageSize = (1 << 12); // 4kB pages
@@ -241,6 +358,22 @@ struct CUDACachingHostAllocatorImpl
       // Map pages in the same thread
       mapPagesForRegister(*ptr, roundSize, 0, 1, pageSize);
     }
+
+#ifdef __linux__
+    if (unmovable) {
+      // Pin before cudaHostRegister: a long-term pin first migrates pages out
+      // of ZONE_MOVABLE / CMA, which must happen before the driver maps them.
+      int fd = -1;
+      try {
+        fd = longTermPin(*ptr, roundSize);
+      } catch (...) {
+        munmap(*ptr, roundSize);
+        throw;
+      }
+      std::lock_guard<std::mutex> g(stats_.timing_mutex_);
+      unmovable_pins[*ptr] = {roundSize, fd};
+    }
+#endif
 
     // Register the mapped pages using cudaHostRegister
     if (current_stream_is_capturing_fast_path()) {

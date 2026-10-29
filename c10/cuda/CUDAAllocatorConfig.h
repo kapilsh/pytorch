@@ -180,6 +180,13 @@ class C10_CUDA_API CUDAAllocatorConfig {
     return instance().m_pinned_free_catch_all;
   }
 
+  // When enabled, pinned memory is also long-term pinned so the kernel cannot
+  // migrate it (compaction, reclaim, NUMA balancing). See pinned_unmovable in
+  // docs/source/notes/cuda.md.
+  static bool pinned_unmovable() {
+    return instance().m_pinned_unmovable;
+  }
+
   C10_DEPRECATED_MESSAGE(
       "c10::cuda::CUDACachingAllocator::CUDAAllocatorConfig::roundup_power2_divisions() is deprecated. Please use c10::CachingAllocator::AcceleratorAllocatorConfig::roundup_power2_divisions() instead.")
   static size_t roundup_power2_divisions(size_t size) {
@@ -247,6 +254,7 @@ class C10_CUDA_API CUDAAllocatorConfig {
         "pinned_num_register_threads",
         "per_process_memory_fraction",
         "pinned_free_catch_all",
+        "pinned_unmovable",
         "throw_on_cudamalloc_oom",
         "expandable_segments_reserve",
         "expandable_segments_reserve_by_class"};
@@ -280,6 +288,9 @@ class C10_CUDA_API CUDAAllocatorConfig {
   size_t parsePinnedFreeCatchAll(
       const c10::CachingAllocator::ConfigTokenizer& tokenizer,
       size_t i);
+  size_t parsePinnedUnmovable(
+      const c10::CachingAllocator::ConfigTokenizer& tokenizer,
+      size_t i);
   size_t parseThrowOnCudaMallocOom(
       const c10::CachingAllocator::ConfigTokenizer& tokenizer,
       size_t i);
@@ -302,6 +313,7 @@ class C10_CUDA_API CUDAAllocatorConfig {
   std::atomic<bool> m_graph_capture_record_stream_reuse{false};
   std::atomic<double> m_per_process_memory_fraction{1.0};
   std::atomic<bool> m_pinned_free_catch_all{false};
+  std::atomic<bool> m_pinned_unmovable{false};
   // When true, throw OOM error before calling cudaMalloc if allocation would
   // fail
   std::atomic<bool> m_throw_on_cudamalloc_oom{false};

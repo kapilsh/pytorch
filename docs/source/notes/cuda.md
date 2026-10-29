@@ -673,6 +673,18 @@ Available options:
   allocation time of pinned memory. A good value for this option is 8 based on
   benchmarking results.
 
+* `pinned_unmovable` option is a boolean flag (Linux only) that makes pinned memory
+  unmovable by the kernel. Memory pinned with cudaHostAlloc or cudaHostRegister can
+  still be migrated by the kernel (for example by memory compaction when a NUMA node
+  is low on free memory), and a copy that touches a page under migration can stall for
+  hundreds of milliseconds. When set to True, pinned memory is allocated in a shared
+  anonymous mapping, long-term pinned through io_uring buffer registration (the same
+  kernel pin an RDMA memory registration takes, without needing an RDMA device), and
+  then registered with cudaHostRegister. The pinned memory counts against
+  `RLIMIT_MEMLOCK` unless the process has `CAP_IPC_LOCK`, and allocation fails if
+  io_uring is disabled. Because the memory is a shared mapping, forked child processes
+  share it with the parent instead of getting a copy.
+
 * `pinned_use_background_threads` option is a boolean flag to enable background thread
   for processing events. This avoids any slow path associated with querying/processing of
   events in the fast allocation path. This feature is disabled by default.

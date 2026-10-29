@@ -115,6 +115,9 @@ void CUDAAllocatorConfig::parseArgs(const std::string& env) {
     } else if (key == "pinned_free_catch_all") {
       i = parsePinnedFreeCatchAll(tokenizer, i);
       used_native_specific_option = true;
+    } else if (key == "pinned_unmovable") {
+      i = parsePinnedUnmovable(tokenizer, i);
+      used_native_specific_option = true;
     } else if (key == "throw_on_cudamalloc_oom") {
       i = parseThrowOnCudaMallocOom(tokenizer, i);
       used_native_specific_option = true;
@@ -212,6 +215,14 @@ size_t CUDAAllocatorConfig::parsePinnedFreeCatchAll(
     size_t i) {
   tokenizer.checkToken(++i, ":");
   m_pinned_free_catch_all = tokenizer.toBool(++i);
+  return i;
+}
+
+size_t CUDAAllocatorConfig::parsePinnedUnmovable(
+    const c10::CachingAllocator::ConfigTokenizer& tokenizer,
+    size_t i) {
+  tokenizer.checkToken(++i, ":");
+  m_pinned_unmovable = tokenizer.toBool(++i);
   return i;
 }
 
