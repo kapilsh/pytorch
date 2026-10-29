@@ -46,54 +46,194 @@ using Block = HostBlock<CUDAStream>;
 // The memory must be a shared mapping: on fork, the kernel copies long-term
 // pinned pages of a private mapping into the child instead of sharing them.
 
-// io_uring_register limits each registered buffer to 1 GiB.
+// io_uring ABI (include/uapi/linux/io_uring.h).
+constexpr unsigned kIoUringRegisterBuffers2 = 15;
+constexpr unsigned kIoUringRegisterBuffersUpdate = 16;
+constexpr unsigned kIoUringRsrcRegisterSparse = 1;
+struct IoUringRsrcRegister {
+  uint32_t nr;
+  uint32_t flags;
+  uint64_t resv2;
+  uint64_t data;
+  uint64_t tags;
+};
+struct IoUringRsrcUpdate2 {
+  uint32_t offset;
+  uint32_t resv;
+  uint64_t data;
+  uint64_t tags;
+  uint32_t nr;
+  uint32_t resv2;
+};
+static_assert(sizeof(IoUringRsrcRegister) == 32);
+static_assert(sizeof(IoUringRsrcUpdate2) == 32);
+// Kernel limits: slots per ring, and bytes per registered buffer.
+constexpr unsigned kIoUringMaxRegBuffers = 1u << 14;
 constexpr size_t kMaxIoUringBufferSize = size_t(1) << 30;
-constexpr unsigned kIoUringRegisterBuffers = 0;
-constexpr unsigned kIoUringUnregisterBuffers = 1;
 
-// Long-term pins [ptr, ptr + size). Returns an io_uring fd that holds the pin.
-int longTermPin(void* ptr, size_t size) {
-  // struct io_uring_params is 120 bytes; all zeros asks for the defaults.
-  alignas(8) std::array<char, 120> params{};
-  int fd = static_cast<int>(syscall(__NR_io_uring_setup, 1, params.data()));
-  TORCH_CHECK(
-      fd >= 0,
-      "pinned_unmovable: io_uring_setup failed: ",
-      c10::utils::str_error(errno),
-      ". io_uring may be disabled (sysctl kernel.io_uring_disabled) or "
-      "blocked by a seccomp profile.");
-  std::vector<iovec> iovs;
-  for (size_t off = 0; off < size; off += kMaxIoUringBufferSize) {
-    iovs.push_back(
-        {static_cast<char*>(ptr) + off,
-         std::min(kMaxIoUringBufferSize, size - off)});
+// Long-term pins memory into the slots of shared io_uring buffer tables, one
+// slot per GiB, so the process holds one fd per 16K slots rather than one per
+// allocation. Unpinning clears the slots, which drops the pins even if a
+// forked child holds a copy of the ring fd.
+class LongTermPinner {
+ public:
+  struct Pin {
+    pid_t pid;
+    std::vector<std::pair<size_t, unsigned>> slots; // (ring index, slot)
+  };
+
+  Pin pin(void* ptr, size_t size) {
+    std::lock_guard<std::mutex> g(mutex_);
+    if (pid_ != getpid()) {
+      // In a forked child: the inherited rings and slot lists are the parent's.
+      for (auto& ring : rings_) {
+        close(ring.fd);
+      }
+      rings_.clear();
+      pid_ = getpid();
+    }
+    Pin pin{pid_, {}};
+    for (size_t off = 0; off < size; off += kMaxIoUringBufferSize) {
+      size_t r = 0;
+      while (r < rings_.size() && rings_[r].free_slots.empty()) {
+        r++;
+      }
+      if (r == rings_.size()) {
+        addRing();
+      }
+      unsigned slot = rings_[r].free_slots.back();
+      size_t len = std::min(kMaxIoUringBufferSize, size - off);
+      int err = setSlot(rings_[r].fd, slot, static_cast<char*>(ptr) + off, len);
+      if (err != 0) {
+        for (auto [pr, ps] : pin.slots) {
+          setSlot(rings_[pr].fd, ps, nullptr, 0);
+          rings_[pr].free_slots.push_back(ps);
+        }
+        TORCH_CHECK(
+            false,
+            "pinned_unmovable: pinning ",
+            size,
+            " bytes failed: ",
+            c10::utils::str_error(err),
+            err == ENOMEM ? " (check RLIMIT_MEMLOCK)" : "");
+      }
+      rings_[r].free_slots.pop_back();
+      pin.slots.emplace_back(r, slot);
+    }
+    return pin;
   }
-  if (syscall(
-          __NR_io_uring_register,
-          fd,
-          kIoUringRegisterBuffers,
-          iovs.data(),
-          iovs.size()) != 0) {
-    int err = errno;
-    close(fd);
+
+  void unpin(const Pin& pin) {
+    std::lock_guard<std::mutex> g(mutex_);
+    if (pin.pid != pid_) {
+      return; // pinned by the parent of this forked child
+    }
+    for (auto [r, slot] : pin.slots) {
+      setSlot(rings_[r].fd, slot, nullptr, 0);
+      rings_[r].free_slots.push_back(slot);
+    }
+  }
+
+ private:
+  struct Ring {
+    int fd;
+    std::vector<unsigned> free_slots;
+  };
+
+  void addRing() {
+    // struct io_uring_params is 120 bytes; all zeros asks for the defaults.
+    alignas(8) std::array<char, 120> params{};
+    int fd = static_cast<int>(syscall(__NR_io_uring_setup, 1, params.data()));
     TORCH_CHECK(
-        false,
-        "pinned_unmovable: pinning ",
-        size,
-        " bytes failed: ",
-        c10::utils::str_error(err),
-        err == ENOMEM ? " (check RLIMIT_MEMLOCK)" : "");
+        fd >= 0,
+        "pinned_unmovable: io_uring_setup failed: ",
+        c10::utils::str_error(errno),
+        ". io_uring may be disabled (sysctl kernel.io_uring_disabled) or "
+        "blocked by a seccomp profile.");
+    IoUringRsrcRegister reg{
+        kIoUringMaxRegBuffers, kIoUringRsrcRegisterSparse, 0, 0, 0};
+    if (syscall(
+            __NR_io_uring_register,
+            fd,
+            kIoUringRegisterBuffers2,
+            &reg,
+            sizeof(reg)) != 0) {
+      int err = errno;
+      close(fd);
+      TORCH_CHECK(
+          false,
+          "pinned_unmovable: creating an io_uring buffer table failed: ",
+          c10::utils::str_error(err),
+          ". Needs Linux 5.19 or later.");
+    }
+    Ring ring{fd, {}};
+    ring.free_slots.reserve(kIoUringMaxRegBuffers);
+    for (unsigned i = kIoUringMaxRegBuffers; i > 0; i--) {
+      ring.free_slots.push_back(i - 1);
+    }
+    rings_.push_back(std::move(ring));
   }
-  return fd;
+
+  // Points `slot` at [base, base + len), or clears it if base is null. Returns
+  // 0 or an errno.
+  static int setSlot(int fd, unsigned slot, void* base, size_t len) {
+    iovec iov{base, len};
+    IoUringRsrcUpdate2 update{
+        slot, 0, reinterpret_cast<uint64_t>(&iov), 0, 1, 0};
+    if (syscall(
+            __NR_io_uring_register,
+            fd,
+            kIoUringRegisterBuffersUpdate,
+            &update,
+            sizeof(update)) != 1) {
+      return errno;
+    }
+    return 0;
+  }
+
+  std::mutex mutex_;
+  pid_t pid_ = getpid();
+  std::vector<Ring> rings_;
+};
+
+// A shared mapping, so that forks do not copy the long-term pinned pages.
+void* mapShared(size_t size) {
+  void* ptr = mmap(
+      nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  TORCH_CHECK(
+      ptr != MAP_FAILED,
+      "pinned_unmovable: mmap of ",
+      size,
+      " bytes failed: ",
+      c10::utils::str_error(errno));
+  return ptr;
 }
 
-void longTermUnpin(int fd) {
-  // Unregister before closing: a forked child holding a copy of the fd would
-  // otherwise keep the pages pinned until it exits.
-  syscall(__NR_io_uring_register, fd, kIoUringUnregisterBuffers, nullptr, 0);
-  close(fd);
+void unmapShared(void* ptr, size_t size) {
+  munmap(ptr, size);
 }
+#else
+struct LongTermPinner {
+  struct Pin {};
+  Pin pin(void*, size_t) {
+    return {};
+  }
+  void unpin(const Pin&) {}
+};
+
+void* mapShared(size_t) {
+  TORCH_CHECK(false, "pinned_unmovable is only supported on Linux");
+  return nullptr;
+}
+
+void unmapShared(void*, size_t) {}
 #endif
+
+LongTermPinner& longTermPinner() {
+  // Leaked so pinned blocks can still be freed during static destruction.
+  static auto* pinner = new LongTermPinner();
+  return *pinner;
+}
 
 struct CUDACachingHostAllocatorImpl
     : public CachingHostAllocatorImpl<CUDAStream, CUDAEventPool::Event> {
@@ -118,8 +258,9 @@ struct CUDACachingHostAllocatorImpl
 
  private:
   ska::flat_hash_map<void*, bool> use_host_register;
-  // pinned_unmovable allocations: ptr -> (size, fd holding the long-term pin).
-  ska::flat_hash_map<void*, std::pair<size_t, int>> unmovable_pins;
+  // pinned_unmovable allocations: ptr -> (size, long-term pin).
+  ska::flat_hash_map<void*, std::pair<size_t, LongTermPinner::Pin>>
+      unmovable_pins;
 
   void allocate_host_memory(size_t size, void** ptr) override {
     // try allocating from reserve segment first before calling into expensive APIs
@@ -195,23 +336,21 @@ struct CUDACachingHostAllocatorImpl
     // cudaHostUnregister and similarly for cudaHostAlloc / cudaFreeHost.
     void* ptr = block->ptr_;
     bool use_register = false;
-    std::optional<std::pair<size_t, int>> unmovable_pin;
+    std::optional<std::pair<size_t, LongTermPinner::Pin>> unmovable_pin;
     {
       std::lock_guard<std::mutex> g(stats_.timing_mutex_);
       TORCH_INTERNAL_ASSERT_DEBUG_ONLY(use_host_register.count(ptr) == 1);
       use_register = use_host_register[ptr];
       auto it = unmovable_pins.find(ptr);
       if (it != unmovable_pins.end()) {
-        unmovable_pin = it->second;
+        unmovable_pin = std::move(it->second);
         unmovable_pins.erase(it);
       }
     }
     if (unmovable_pin) {
-#ifdef __linux__
       AT_CUDA_CHECK(cudaHostUnregister(ptr));
-      longTermUnpin(unmovable_pin->second);
-      munmap(ptr, unmovable_pin->first);
-#endif
+      longTermPinner().unpin(unmovable_pin->second);
+      unmapShared(ptr, unmovable_pin->first);
     } else if (use_register) {
       AT_CUDA_CHECK(cudaHostUnregister(ptr));
       // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
@@ -295,24 +434,7 @@ struct CUDACachingHostAllocatorImpl
     // cudaHostRegister with GPU mapping flags to lock the pages, so we
     // can minimize the cost for the cuda global lock.
     if (unmovable) {
-#ifdef __linux__
-      // A shared mapping, so that forks do not copy the long-term pinned pages.
-      *ptr = mmap(
-          nullptr,
-          roundSize,
-          PROT_READ | PROT_WRITE,
-          MAP_SHARED | MAP_ANONYMOUS,
-          -1,
-          0);
-      TORCH_CHECK(
-          *ptr != MAP_FAILED,
-          "pinned_unmovable: mmap of ",
-          roundSize,
-          " bytes failed: ",
-          c10::utils::str_error(errno));
-#else
-      TORCH_CHECK(false, "pinned_unmovable is only supported on Linux");
-#endif
+      *ptr = mapShared(roundSize);
     } else {
       // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
       *ptr = std::malloc(roundSize);
@@ -359,28 +481,40 @@ struct CUDACachingHostAllocatorImpl
       mapPagesForRegister(*ptr, roundSize, 0, 1, pageSize);
     }
 
-#ifdef __linux__
+    LongTermPinner::Pin pin;
     if (unmovable) {
       // Pin before cudaHostRegister: a long-term pin first migrates pages out
       // of ZONE_MOVABLE / CMA, which must happen before the driver maps them.
-      int fd = -1;
       try {
-        fd = longTermPin(*ptr, roundSize);
+        pin = longTermPinner().pin(*ptr, roundSize);
       } catch (...) {
-        munmap(*ptr, roundSize);
+        unmapShared(*ptr, roundSize);
         throw;
       }
-      std::lock_guard<std::mutex> g(stats_.timing_mutex_);
-      unmovable_pins[*ptr] = {roundSize, fd};
     }
-#endif
 
     // Register the mapped pages using cudaHostRegister
+    cudaError_t err = cudaSuccess;
     if (current_stream_is_capturing_fast_path()) {
       at::cuda::CUDAStreamCaptureModeGuard g{cudaStreamCaptureModeRelaxed};
-      AT_CUDA_CHECK(cudaHostRegister(*ptr, roundSize, cudaHostRegisterDefault));
+      err = cudaHostRegister(*ptr, roundSize, cudaHostRegisterDefault);
     } else {
-      AT_CUDA_CHECK(cudaHostRegister(*ptr, roundSize, cudaHostRegisterDefault));
+      err = cudaHostRegister(*ptr, roundSize, cudaHostRegisterDefault);
+    }
+    if (err != cudaSuccess) {
+      // Release the memory so that a failed allocation does not leak it.
+      if (unmovable) {
+        longTermPinner().unpin(pin);
+        unmapShared(*ptr, roundSize);
+      } else {
+        // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
+        std::free(*ptr);
+      }
+      AT_CUDA_CHECK(err);
+    }
+    if (unmovable) {
+      std::lock_guard<std::mutex> g(stats_.timing_mutex_);
+      unmovable_pins.emplace(*ptr, std::make_pair(roundSize, std::move(pin)));
     }
   }
 

@@ -681,8 +681,8 @@ Available options:
   anonymous mapping, long-term pinned through io_uring buffer registration (the same
   kernel pin an RDMA memory registration takes, without needing an RDMA device), and
   then registered with cudaHostRegister. The pinned memory counts against
-  `RLIMIT_MEMLOCK` unless the process has `CAP_IPC_LOCK`, and allocation fails if
-  io_uring is disabled. Because the memory is a shared mapping, forked child processes
+  `RLIMIT_MEMLOCK` unless the process has `CAP_IPC_LOCK`. Requires Linux 5.19 or later,
+  and allocation fails if io_uring is disabled. Because the memory is a shared mapping, forked child processes
   share it with the parent instead of getting a copy.
 
 * `pinned_use_background_threads` option is a boolean flag to enable background thread
