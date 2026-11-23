@@ -3389,6 +3389,17 @@ class DeviceCachingAllocator {
     no_split_pools.insert(mempool_id);
   }
 
+  // nullopt if this device has no pool with this id, otherwise whether the
+  // pool has a custom allocator.
+  std::optional<bool> poolHasAllocator(const MempoolId_t& mempool_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    auto it = graph_pools.find(mempool_id);
+    if (it == graph_pools.end()) {
+      return std::nullopt;
+    }
+    return it->second->allocator() != nullptr;
+  }
+
   // See Note [Interaction with CUDA graph capture]
 
   // Routes allocations matching `filter` into the private mempool
@@ -5673,6 +5684,22 @@ class NativeCachingAllocator : public CUDAAllocator {
       MempoolId_t mempool_id,
       std::function<bool(cudaStream_t)> filter) override {
     assertValidDevice(device);
+    // A MemPool's custom allocator exists only on the device that was current
+    // when the pool was created. On another device, beginAllocateToPool would
+    // create a new pool without the allocator.
+    if (!device_allocator[device]->poolHasAllocator(mempool_id).has_value()) {
+      for (const auto d : c10::irange(device_allocator.size())) {
+        TORCH_CHECK(
+            !device_allocator[d]->poolHasAllocator(mempool_id).value_or(false),
+            "This memory pool has a custom allocator on device ",
+            d,
+            " and cannot route allocations on device ",
+            static_cast<int>(device),
+            ". Create the pool while device ",
+            static_cast<int>(device),
+            " is the current device.");
+      }
+    }
     device_allocator[device]->beginAllocateToPool(
         std::move(mempool_id), std::move(filter));
   }

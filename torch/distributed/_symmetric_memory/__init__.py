@@ -2515,12 +2515,15 @@ def get_mem_pool(device: _device) -> torch.cuda.MemPool | torch.xpu.MemPool:
     # allocation.
     if device not in _symm_mem_pools:
         allocator = get_mempool_allocator(device)
-        # Create a new pool with the given allocator and the preset options.
-        _symm_mem_pools[device] = torch.get_device_module(device).MemPool(
-            allocator,
-            use_on_oom=False,
-            no_split=True,
-        )
+        device_module = torch.get_device_module(device)
+        # Create a new pool with the given allocator and the preset options. A
+        # pool belongs to the current device.
+        with device_module.device(device):
+            _symm_mem_pools[device] = device_module.MemPool(
+                allocator,
+                use_on_oom=False,
+                no_split=True,
+            )
 
     return _symm_mem_pools[device]
 

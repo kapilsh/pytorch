@@ -1671,6 +1671,9 @@ class MemPool(_MemPool):
     r"""MemPool represents a pool of memory in a caching allocator. Currently,
     it's just the ID of the pool object maintained in the CUDACachingAllocator.
 
+    The pool belongs to the device that is current when the pool is created. A
+    pool with an :attr:`allocator` can route allocations only on that device.
+
     Args:
         allocator(torch._C._cuda_CUDAAllocator, optional): a
             torch._C._cuda_CUDAAllocator object that can be used to
@@ -1981,6 +1984,7 @@ def _use_uvm(device: "Device" = None):
     .. note::
         Requires the ``cuda-python`` package (``cuda.bindings``).
     """
-    pool = _make_uvm_pool()
+    with torch.cuda.device(device):
+        pool = _make_uvm_pool()
     with use_mem_pool(pool, device=device):
         yield pool
